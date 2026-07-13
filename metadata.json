@@ -1,0 +1,6 @@
+{
+  "name": "Gemini Key-Rotator & Coding Agent",
+  "description": "An interactive coding workspace featuring automatic API key failover, a powerful multi-role coding agent, and high-quality image generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
