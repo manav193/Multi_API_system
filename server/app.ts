@@ -4,35 +4,52 @@ import cookieParser from "cookie-parser";
 import sessionRouter from "./routes/session.js";
 import keysRouter from "./routes/keys.js";
 import aiRouter from "./routes/ai.js";
-import { loadSession, validateOriginAndCSRF } from "./middleware/auth.js";
+import { loadSession, validateOriginAndCSRF, corsMiddleware } from "./middleware/auth.js";
 import { securityHeaders, payloadSizeLimit, requestTimeout } from "./middleware/security.js";
 import { assignRequestId, errorHandler } from "./middleware/error.js";
 
 export async function createApp() {
   const app = express();
 
+  // Move production store validation to startup (never call process.exit inside constructors)
+  const isProd = process.env.NODE_ENV === "production";
+  const allowOverride = process.env.ALLOW_IN_MEMORY_STORE === "true";
+  if (isProd && !allowOverride) {
+    console.error(
+      "CRITICAL ERROR: InMemory stores selected in production mode! Please set ALLOW_IN_MEMORY_STORE=true for single-instance testing or use Redis."
+    );
+    process.exit(1);
+  }
+
+  // Configure Express trust proxy explicitly for the deployment
+  const trustProxyVal = process.env.TRUST_PROXY || "127.0.0.1, ::1, loopback";
+  app.set("trust proxy", trustProxyVal === "true" ? true : trustProxyVal === "false" ? false : trustProxyVal);
+
   // 1. Core Request Configuration
   app.use(express.json({ limit: "2mb" }));
   app.use(cookieParser());
 
-  // 2. Global Security and Request Context middlewares
+  // 2. Global CORS setup
+  app.use(corsMiddleware);
+
+  // 3. Global Security and Request Context middlewares
   app.use(securityHeaders);
   app.use(assignRequestId);
   app.use(payloadSizeLimit);
   app.use(requestTimeout);
 
-  // 3. Session initialization (applies to all /api/ requests)
+  // 4. Session initialization (applies to all /api/ requests)
   app.use("/api", loadSession);
 
-  // 4. Origin and CSRF protection (applies to state-changing endpoints)
+  // 5. Origin and CSRF protection (applies to state-changing endpoints)
   app.use("/api", validateOriginAndCSRF);
 
-  // 5. Mount API Routes
+  // 6. Mount API Routes
   app.use("/api/session", sessionRouter);
   app.use("/api/session/keys", keysRouter);
   app.use("/api", aiRouter); // Maps /api/chat, /api/generate-image, /api/validate-key, /api/system-key-status
 
-  // 6. Static Asset / Vite development middleware loading
+  // 7. Static Asset / Vite development middleware loading
   if (process.env.NODE_ENV !== "production" && process.env.NODE_ENV !== "test") {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
@@ -41,7 +58,7 @@ export async function createApp() {
     });
     app.use(vite.middlewares);
   } else {
-    // In production or tests, serve static assets from dist/client
+    // Serve static assets from dist/client
     const distPath = path.join(process.cwd(), "dist", "client");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
@@ -49,7 +66,7 @@ export async function createApp() {
     });
   }
 
-  // 7. Global Exception/Error Handling (Must be registered last)
+  // 8. Global Exception/Error Handling (Must be registered last)
   app.use(errorHandler);
 
   return app;

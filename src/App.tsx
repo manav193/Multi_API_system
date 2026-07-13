@@ -324,17 +324,18 @@ export default function App() {
         if (systemStatus.hasDefaultKey) {
           pool.push({
             id: "system-default",
-            key: "Injected Server Key", // Never expose default key
             label: "Server Config Key (Default)",
             status: "Ready",
             requestCount: 0,
             isSystemDefault: true,
-          });
+          } as any);
         }
 
         // Migrate custom keys to server registry
         if (legacyKeys.length > 0) {
           addSystemLog(`Migrating ${legacyKeys.length} legacy API keys to secure session store...`);
+          const remainingKeys: any[] = [];
+
           for (const legacyKey of legacyKeys) {
             if (legacyKey.key && legacyKey.key.startsWith("AIzaSy")) {
               try {
@@ -354,22 +355,26 @@ export default function App() {
                   const regData = await regResponse.json();
                   pool.push({
                     id: regData.keyId,
-                    key: regData.maskedKey,
                     label: regData.label,
                     status: "Ready",
                     requestCount: 0,
-                  });
+                  } as any);
                 } else {
                   addSystemLog(`Failed to migrate legacy key: ${legacyKey.label}. It may be invalid.`, "error");
+                  remainingKeys.push(legacyKey);
                 }
               } catch (err) {
                 addSystemLog(`Migration error for key ${legacyKey.label}`, "error");
+                remainingKeys.push(legacyKey);
               }
             }
           }
 
-          // Clear legacy raw keys from localStorage immediately
-          localStorage.removeItem("aegis_custom_keys");
+          if (remainingKeys.length > 0) {
+            localStorage.setItem("aegis_custom_keys", JSON.stringify(remainingKeys));
+          } else {
+            localStorage.removeItem("aegis_custom_keys");
+          }
         }
 
         // 4. Fetch currently registered keys from the session to sync with the pool
@@ -380,11 +385,10 @@ export default function App() {
             if (!pool.some((pk) => pk.id === rk.keyId)) {
               pool.push({
                 id: rk.keyId,
-                key: rk.maskedKey,
                 label: rk.label,
                 status: rk.status || "Ready",
                 requestCount: rk.requestCount || 0,
-              });
+              } as any);
             }
           });
         }
@@ -635,11 +639,10 @@ export default function App() {
 
       const newKey: APIKey = {
         id: data.keyId,
-        key: data.maskedKey,
         label: data.label,
         status: "Ready",
         requestCount: 0,
-      };
+      } as any;
 
       setApiKeys((prev) => [...prev, newKey]);
       addSystemLog(`Successfully registered and activated custom key: ${newKey.label}`, "success");
@@ -684,7 +687,7 @@ export default function App() {
   };
 
   // Validate a single key instantly
-  const handleValidateKey = async (id: string, keyVal: string) => {
+  const handleValidateKey = async (id: string) => {
     setValidatingKeyId(id);
     addSystemLog(`Starting manual validation check for key...`);
     try {
@@ -1223,7 +1226,7 @@ ${files.map((f) => `--- FILE: ${f.path} ---\n${f.content}\n`).join("\n")}
                         </div>
                         <div className="flex items-center gap-1">
                           <button
-                            onClick={() => handleValidateKey(k.id, k.key)}
+                            onClick={() => handleValidateKey(k.id)}
                             disabled={validatingKeyId === k.id}
                             className="p-1 hover:bg-[#2D2D2D] rounded text-slate-400 hover:text-white transition-colors"
                             title="Test connection"
@@ -1244,7 +1247,7 @@ ${files.map((f) => `--- FILE: ${f.path} ---\n${f.content}\n`).join("\n")}
 
                       <div className="flex items-center justify-between font-mono text-[9px] text-slate-500">
                         <span className="truncate max-w-[120px] bg-[#0A0A0B] px-1.5 py-0.5 rounded text-slate-400">
-                          {k.isSystemDefault ? k.key : `${k.key.substring(0, 8)}...${k.key.substring(k.key.length - 4)}`}
+                          {k.isSystemDefault ? "System Key" : "Custom Key"}
                         </span>
                         <span
                           className={`px-1.5 py-0.5 rounded font-bold ${

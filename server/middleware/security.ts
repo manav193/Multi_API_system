@@ -2,7 +2,6 @@ import { Request, Response, NextFunction } from "express";
 import helmet from "helmet";
 
 // Security headers configuration (using Helmet)
-// Sets Content-Security-Policy-Report-Only to avoid breaking existing inline scripts or sandbox blob previews
 export const securityHeaders = helmet({
   contentSecurityPolicy: {
     reportOnly: true,
@@ -32,28 +31,56 @@ export const payloadSizeLimit = (req: Request, res: Response, next: NextFunction
   next();
 };
 
-// Strict request timeout handler (30 seconds)
+// Strict request timeout handler (30 seconds) using one request-scoped AbortController
 export const requestTimeout = (req: Request, res: Response, next: NextFunction) => {
-  // Set response timeout of 30 seconds
-  const timeoutMs = 30000;
+  const abortController = new AbortController();
+  req.abortController = abortController;
+
   const timer = setTimeout(() => {
     if (!res.headersSent) {
-      // Abort the associated request
-      req.destroy();
+      req.timedOut = true;
+      abortController.abort();
       res.status(504).json({
         error: "Gateway Timeout: The request exceeded the 30-second deadline.",
       });
     }
-  }, timeoutMs);
+  }, 30000);
 
-  // Unref timer so it doesn't prevent Node process exit
   if (timer && typeof timer.unref === "function") {
     timer.unref();
   }
 
-  // Clear timer when response ends
-  res.on("finish", () => clearTimeout(timer));
-  res.on("close", () => clearTimeout(timer));
+  const onAborted = () => {
+    abortController.abort();
+  };
+
+  const onClose = () => {
+    if (!res.writableEnded) {
+      abortController.abort();
+    }
+  };
+
+  req.on("aborted", onAborted);
+  res.on("close", onClose);
+
+  const cleanup = () => {
+    clearTimeout(timer);
+    req.off("aborted", onAborted);
+    res.off("close", onClose);
+  };
+
+  res.on("finish", cleanup);
+  res.on("close", cleanup);
 
   next();
 };
+
+// Declare abortController and timedOut on Request in Express
+declare global {
+  namespace Express {
+    interface Request {
+      abortController?: AbortController;
+      timedOut?: boolean;
+    }
+  }
+}

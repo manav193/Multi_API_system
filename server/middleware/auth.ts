@@ -10,22 +10,37 @@ export interface Session {
   keys: Map<string, KeyRegistryEntry>;
 }
 
+// Parse ALLOWED_ORIGINS as an explicit normalized allowlist
+export function getAllowedOrigins(): string[] {
+  const origins = [
+    process.env.APP_URL,
+    process.env.ALLOWED_ORIGINS,
+    "http://localhost:3000",
+  ].filter(Boolean);
+
+  const parsed: string[] = [];
+  for (const o of origins) {
+    const split = o.split(/[,\s]+/);
+    for (const item of split) {
+      const trimmed = item.trim().toLowerCase();
+      if (!trimmed) continue;
+      try {
+        const originUrl = new URL(trimmed);
+        parsed.push(originUrl.origin);
+      } catch {
+        parsed.push(trimmed);
+      }
+    }
+  }
+  return Array.from(new Set(parsed)).filter(Boolean);
+}
+
 // In-Memory Session Store with TTL Cleanup
 export class InMemorySessionStore {
   private sessions: Map<string, Session> = new Map();
   private cleanupInterval: NodeJS.Timeout | null = null;
 
   constructor() {
-    const isProd = process.env.NODE_ENV === "production";
-    const allowOverride = process.env.ALLOW_IN_MEMORY_STORE === "true";
-
-    if (isProd && !allowOverride) {
-      console.error(
-        "CRITICAL ERROR: InMemorySessionStore selected in production mode! Please set ALLOW_IN_MEMORY_STORE=true for single-instance testing or use Redis."
-      );
-      process.exit(1);
-    }
-
     // Active TTL cleanup every minute
     this.cleanupInterval = setInterval(() => this.cleanup(), 60000);
     if (this.cleanupInterval && typeof this.cleanupInterval.unref === "function") {
@@ -46,7 +61,7 @@ export class InMemorySessionStore {
     const sessionId = crypto.randomUUID();
     const csrfToken = crypto.randomBytes(32).toString("hex");
     const now = Date.now();
-    const expiresAt = now + 24 * 60 * 60 * 1000; // 24 Hours
+    const expiresAt = now + 2 * 60 * 60 * 1000; // 2 Hours sliding TTL
 
     const session: Session = {
       sessionId,
@@ -99,47 +114,69 @@ export function constantTimeCompare(a: string, b: string): boolean {
   return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 }
 
-// Origin validation middleware
+// CORS Middleware with credentials and explicit allowed origin (no wildcard)
+export function corsMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const origin = req.headers.origin;
+  if (origin) {
+    try {
+      const originStr = new URL(origin).origin.toLowerCase();
+      const allowed = getAllowedOrigins();
+      if (allowed.includes(originStr)) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Access-Control-Allow-Credentials", "true");
+      }
+    } catch {
+      // Ignore URL parse error
+    }
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-CSRF-Token, Authorization, X-Request-ID");
+
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+}
+
+// Origin validation and CSRF middleware
 export function validateOriginAndCSRF(req: Request, res: Response, next: NextFunction): void {
   const method = req.method;
 
-  // Safe methods do not require CSRF/Origin validation
+  // Safe methods do not require CSRF or state-changing Origin validation
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
     next();
     return;
   }
 
-  // Bypass session initialization endpoint
+  // 1. Validate Origin header for all state-changing requests (including POST /api/session)
+  const origin = req.headers.origin;
+  if (!origin) {
+    res.status(403).json({ error: "Forbidden: Missing Origin header" });
+    return;
+  }
+
+  let originStr: string;
+  try {
+    originStr = new URL(origin).origin.toLowerCase();
+  } catch {
+    res.status(403).json({ error: "Forbidden: Invalid Origin header" });
+    return;
+  }
+
+  const allowed = getAllowedOrigins();
+  if (!allowed.includes(originStr)) {
+    res.status(403).json({ error: "Forbidden: Origin verification failed" });
+    return;
+  }
+
+  // Bypass CSRF for session initialization since session/cookie/token is not established yet
   if (req.path === "/session" || req.path === "/session/") {
     next();
     return;
   }
 
-  // Validate Origin header
-  const origin = req.headers.origin;
-  const referer = req.headers.referer;
-  const host = req.headers.host;
-
-  // In production, enforce exact Origin verification
-  if (process.env.NODE_ENV === "production" && origin) {
-    const allowedOrigins = [
-      process.env.APP_URL,
-      `http://${host}`,
-      `https://${host}`,
-    ].filter(Boolean);
-
-    const isAllowed = allowedOrigins.some((allowed) => {
-      if (!allowed) return false;
-      return origin.startsWith(allowed) || allowed.startsWith(origin);
-    });
-
-    if (!isAllowed) {
-      res.status(403).json({ error: "Forbidden: Origin verification failed" });
-      return;
-    }
-  }
-
-  // Validate CSRF token
+  // 2. Validate CSRF token
   const sessionId = req.cookies?.sessionId;
   if (!sessionId) {
     res.status(401).json({ error: "Unauthorized: Missing session cookie" });
@@ -162,29 +199,33 @@ export function validateOriginAndCSRF(req: Request, res: Response, next: NextFun
   next();
 }
 
-// Session authentication and loading middleware
+// Session authentication and loading middleware with sliding TTL
 export function loadSession(req: Request, res: Response, next: NextFunction): void {
   const sessionStore = getSessionStore();
   let sessionId = req.cookies?.sessionId;
   let session: Session | undefined;
 
+  const sessionTtl = 2 * 60 * 60 * 1000; // 2 Hours sliding TTL
+
   if (sessionId) {
     session = sessionStore.getSession(sessionId);
   }
 
-  // If no session exists or it has expired, create a fresh one automatically
-  if (!session) {
+  if (session) {
+    // Sliding TTL: refresh expiration
+    session.expiresAt = Date.now() + sessionTtl;
+  } else {
     session = sessionStore.createSession();
-    
-    // Set HttpOnly secure session cookie
-    res.cookie("sessionId", session.sessionId, {
-      httpOnly: true,
-      sameSite: "lax",
-      path: "/",
-      maxAge: 24 * 60 * 60 * 1000, // 24 Hours
-      secure: process.env.NODE_ENV === "production" || process.env.SECURE_COOKIES === "true",
-    });
   }
+
+  // Set or refresh HttpOnly secure session cookie
+  res.cookie("sessionId", session.sessionId, {
+    httpOnly: true,
+    sameSite: "lax",
+    path: "/",
+    maxAge: sessionTtl, // 2 Hours sliding TTL
+    secure: process.env.NODE_ENV === "production" || process.env.SECURE_COOKIES === "true",
+  });
 
   // Bind session to request context
   req.session = session;

@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
+import { getSessionStore } from "../middleware/auth.js";
 
 const router = Router();
 
@@ -22,6 +23,22 @@ router.post("/", (req: Request, res: Response, next: NextFunction) => {
   } catch (err) {
     next(err);
   }
+});
+
+// Endpoint to terminate session
+router.post("/logout", (req: Request, res: Response) => {
+  const sessionId = req.cookies?.sessionId;
+  if (sessionId) {
+    const sessionStore = getSessionStore();
+    sessionStore.deleteSession(sessionId);
+  }
+  res.clearCookie("sessionId", {
+    httpOnly: true,
+    sameSite: "lax",
+    path: "/",
+    secure: process.env.NODE_ENV === "production" || process.env.SECURE_COOKIES === "true",
+  });
+  res.json({ success: true });
 });
 
 export default router;

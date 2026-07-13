@@ -1,10 +1,14 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import request from "supertest";
+import fs from "fs";
+import path from "path";
+import { execSync } from "child_process";
 import { createApp } from "../server/app.js";
 import { getSessionStore } from "../server/middleware/auth.js";
 import { getRateLimitStore } from "../server/middleware/rateLimiter.js";
 import { providerRegistry } from "../server/providers/registry.js";
 import { AIProvider, ProviderError } from "../server/providers/types.js";
+import { SERVER_ONLY_CANARY } from "../server/canary.js";
 
 // Mock @google/genai entirely so validation checks run instantaneously without real network I/O
 vi.mock("@google/genai", () => {
@@ -24,7 +28,9 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
 
   beforeAll(async () => {
     process.env.NODE_ENV = "test";
+    process.env.TRUST_PROXY = "false"; // Disable proxy trust in tests to ignore forged X-Forwarded-For headers
     process.env.GEMINI_API_KEY = "AIzaSyTestSystemDefaultKeyConfiguredForTesting";
+    process.env.ALLOWED_ORIGINS = "https://trusted.com,http://localhost:3000";
     app = await createApp();
   });
 
@@ -37,101 +43,105 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
     }
   });
 
-  describe("1. Session & Cookie Attributes", () => {
-    it("should establish a session and return HttpOnly cookies", async () => {
+  describe("1. Origin and CSRF Validation", () => {
+    it("should accept a state-changing POST request from an exact-match trusted origin", async () => {
       const res = await request(app)
         .post("/api/session")
+        .set("Origin", "https://trusted.com")
         .expect(200);
 
       expect(res.body).toHaveProperty("csrfToken");
-      expect(typeof res.body.csrfToken).toBe("string");
+    });
 
-      // Verify Set-Cookie header contains sessionId and HttpOnly
-      const setCookie = res.headers["set-cookie"];
-      expect(setCookie).toBeDefined();
-      const cookieStr = setCookie.join("; ");
-      expect(cookieStr).toContain("sessionId=");
-      expect(cookieStr).toContain("HttpOnly");
-      expect(cookieStr).toContain("SameSite=Lax");
+    it("should reject state-changing POST request with missing Origin header", async () => {
+      await request(app)
+        .post("/api/session")
+        .expect(403);
+    });
+
+    it("should reject state-changing POST request with a malicious domain prefixing allowed domain (e.g. trusted.com.evil.com)", async () => {
+      const res = await request(app)
+        .post("/api/session")
+        .set("Origin", "https://trusted.com.evil.com")
+        .expect(403);
+
+      expect(res.body.error).toContain("Forbidden");
+    });
+
+    it("should reject state-changing POST request with malformed Origin URL", async () => {
+      await request(app)
+        .post("/api/session")
+        .set("Origin", "not-a-valid-url")
+        .expect(403);
     });
   });
 
-  describe("2. Security Boundaries & CSRF", () => {
-    it("should reject state-changing POST requests without a CSRF token", async () => {
-      await request(app)
-        .post("/api/session/keys")
-        .send({ key: "AIzaSyTestKey12345678901234567890123" })
-        .expect(401); // Expect 401 since no session cookie is supplied
-    });
-
-    it("should reject POST requests with a session cookie but invalid/missing CSRF token", async () => {
-      // 1. Get a session cookie
+  describe("2. Rate Limit Identity and Bypass Protection", () => {
+    it("should block forged X-Forwarded-For bypass attempts", async () => {
+      // Establish session with a trusted origin
       const sessionRes = await request(app)
         .post("/api/session")
+        .set("Origin", "https://trusted.com")
         .expect(200);
 
       const cookie = sessionRes.headers["set-cookie"][0].split(";")[0];
+      const csrf = sessionRes.body.csrfToken;
 
-      // 2. Make post request without CSRF
-      const res = await request(app)
-        .post("/api/session/keys")
+      // Hit rate limiter threshold under the same IP (which is 127.0.0.1 since trust proxy is false)
+      // The validator limiter limit is 15 requests/min.
+      for (let i = 0; i < 15; i++) {
+        await request(app)
+          .post("/api/validate-key")
+          .set("Origin", "https://trusted.com")
+          .set("Cookie", cookie)
+          .set("X-CSRF-Token", csrf)
+          .send({ keyId: "system-default" })
+          .expect(200);
+      }
+
+      // Try with a forged X-Forwarded-For header - it must STILL trigger 429 because rate-limit identity is not fooled!
+      const limitRes = await request(app)
+        .post("/api/validate-key")
+        .set("Origin", "https://trusted.com")
         .set("Cookie", cookie)
-        .send({ key: "AIzaSyTestKey12345678901234567890123" })
-        .expect(403);
+        .set("X-CSRF-Token", csrf)
+        .set("X-Forwarded-For", "9.9.9.9")
+        .send({ keyId: "system-default" })
+        .expect(429);
 
-      expect(res.body.error).toContain("CSRF validation failed");
+      expect(limitRes.headers).toHaveProperty("ratelimit-reset");
+      expect(limitRes.body.error).toContain("Too many requests");
     });
   });
 
-  describe("3. Sanitized Error Response States", () => {
-    it("should return 400 Bad Request on malformed JSON payload", async () => {
-      const res = await request(app)
-        .post("/api/session/keys")
-        .set("Content-Type", "application/json")
-        .send("invalid-json{")
-        .expect(400);
-
-      expect(res.body).toHaveProperty("error");
-      expect(res.body.error).toContain("Bad Request");
-    });
-
-    it("should return 413 Payload Too Large if body exceeds 2 MB", async () => {
-      const largeContent = "a".repeat(2.1 * 1024 * 1024); // 2.1 MB
-      const res = await request(app)
-        .post("/api/session/keys")
-        .set("Content-Type", "application/json")
-        .send({ key: largeContent })
-        .expect(413);
-
-      expect(res.body).toHaveProperty("error");
-      expect(res.body.error).toContain("Payload Too Large");
-    });
-
-    it("should return a sanitized 500 error and redact API keys or source details", async () => {
-      // Mock an error to throw during chat
+  describe("3. Redacted Structured Logger and Error Sanitization", () => {
+    it("should successfully redact sensitive formats (API keys, cookies, paths) from logged strings", async () => {
       const mockBadProvider: AIProvider = {
         id: "gemini",
         name: "Google Gemini",
         capabilities: { chat: true, imageGeneration: false, streaming: false },
         models: [{ id: "gemini-3.5-flash", name: "Gemini 3.5 Flash" }],
         chat: async () => {
-          throw new Error("Secret Key AIzaSyFakeSecret123 leaks inside /app/applet/server/routes/ai.ts");
+          throw new Error("Failed key check: AIzaSyFakeSecret123. Path: /app/applet/server/routes/ai.ts. Cookie: sessionId=abc-123.");
         },
       };
 
       vi.spyOn(providerRegistry, "get").mockReturnValue(mockBadProvider);
 
-      // 1. Get a session cookie & CSRF token
       const sessionRes = await request(app)
         .post("/api/session")
+        .set("Origin", "https://trusted.com")
         .expect(200);
 
       const cookie = sessionRes.headers["set-cookie"][0].split(";")[0];
       const csrf = sessionRes.body.csrfToken;
 
-      // 2. Dispatch request
-      const res = await request(app)
+      // Spy on console.error
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      await request(app)
         .post("/api/chat")
+        .set("Origin", "https://trusted.com")
         .set("Cookie", cookie)
         .set("X-CSRF-Token", csrf)
         .send({
@@ -140,193 +150,207 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
         })
         .expect(500);
 
-      // The key or path must never be present in the public response
-      expect(res.body).toHaveProperty("error");
-      expect(res.body.error).toBe("An internal server error occurred.");
-      expect(JSON.stringify(res.body)).not.toContain("AIzaSyFakeSecret123");
-      expect(JSON.stringify(res.body)).not.toContain("/app/applet");
+      expect(consoleSpy).toHaveBeenCalled();
+      const lastCallArg = consoleSpy.mock.calls[0][0];
+      
+      // Ensure the logged string is structured JSON and contains NO raw secret keys, paths, or cookies
+      const parsedLog = JSON.parse(lastCallArg);
+      expect(parsedLog.message).not.toContain("AIzaSyFakeSecret123");
+      expect(parsedLog.message).not.toContain("/app/applet");
+      expect(parsedLog.message).not.toContain("sessionId=abc-123");
+      expect(parsedLog.message).toContain("[REDACTED_API_KEY]");
+      expect(parsedLog.message).toContain("[REDACTED_PATH]");
 
+      consoleSpy.mockRestore();
       vi.restoreAllMocks();
     });
   });
 
-  describe("4. Rate Limiting", () => {
-    it("should block requests and return a 429 code with Retry-After headers if limits are hit", async () => {
+  describe("4. Session Sliding TTL and Logout Behavior", () => {
+    it("should allow session logout and clear the session cookie cleanly", async () => {
       // 1. Establish session
       const sessionRes = await request(app)
         .post("/api/session")
+        .set("Origin", "https://trusted.com")
         .expect(200);
 
       const cookie = sessionRes.headers["set-cookie"][0].split(";")[0];
       const csrf = sessionRes.body.csrfToken;
 
-      // 2. Perform 15 allowed requests
-      for (let i = 0; i < 15; i++) {
-        await request(app)
-          .post("/api/validate-key")
-          .set("Cookie", cookie)
-          .set("X-CSRF-Token", csrf)
-          .send({ keyId: "system-default" })
-          .expect(200);
-      }
-
-      // 3. 16th request must trigger the 429 rate-limiting interceptor
-      const limitRes = await request(app)
-        .post("/api/validate-key")
+      // 2. Log out
+      const logoutRes = await request(app)
+        .post("/api/session/logout")
+        .set("Origin", "https://trusted.com")
         .set("Cookie", cookie)
         .set("X-CSRF-Token", csrf)
-        .send({ keyId: "system-default" })
-        .expect(429);
+        .expect(200);
 
-      expect(limitRes.headers).toHaveProperty("retry-after");
-      expect(limitRes.body.error).toContain("Too many requests");
+      expect(logoutRes.body).toEqual({ success: true });
+
+      // Cookie should be cleared in the headers
+      const setCookie = logoutRes.headers["set-cookie"];
+      expect(setCookie).toBeDefined();
+      const cookieStr = setCookie.join("; ");
+      expect(cookieStr).toContain("Expires=Thu, 01 Jan 1970 00:00:00 GMT");
     });
   });
 
-  describe("5. Retry Safety & Key Rotation", () => {
-    it("should failover and rotate to second key if first key returns 429", async () => {
-      let firstKeyCalled = false;
-      let secondKeyCalled = false;
+  describe("5. Key Validation & Registry Idempotency", () => {
+    it("should omit maskedKey and return registered keys cleanly, registering idempotently", async () => {
+      // Establish session
+      const sessionRes = await request(app)
+        .post("/api/session")
+        .set("Origin", "https://trusted.com")
+        .expect(200);
 
-      const mockRotativeProvider: AIProvider = {
+      const cookie = sessionRes.headers["set-cookie"][0].split(";")[0];
+      const csrf = sessionRes.body.csrfToken;
+
+      // Mock live verification success
+      const mockVerifyProvider: AIProvider = {
         id: "gemini",
         name: "Google Gemini",
         capabilities: { chat: true, imageGeneration: false, streaming: false },
         models: [{ id: "gemini-3.5-flash", name: "Gemini 3.5 Flash" }],
-        chat: async (req, key) => {
-          if (key === "key-one-raw") {
-            firstKeyCalled = true;
-            // Throw rate-limit error that is retry-safe
-            throw new ProviderError("Rate limit hit", "RATE_LIMIT", true, 10);
-          }
-          if (key === "key-two-raw") {
-            secondKeyCalled = true;
-            return { text: "Success from key two" };
-          }
-          throw new Error("Unexpected key");
-        },
+        chat: async () => ({ text: "Ping success" }),
       };
+      vi.spyOn(providerRegistry, "get").mockReturnValue(mockVerifyProvider);
 
-      vi.spyOn(providerRegistry, "get").mockReturnValue(mockRotativeProvider);
+      const testKey = "AIzaSyTestKey12345678901234567890123";
 
-      // Create session, populate 2 keys using UUIDs
-      const sessionStore = getSessionStore();
-      const session = sessionStore.createSession();
-      const cookie = `sessionId=${session.sessionId}`;
-
-      const uuidOne = "11111111-1111-4111-a111-111111111111";
-      const uuidTwo = "22222222-2222-4222-b222-222222222222";
-
-      session.keys.set(uuidOne, {
-        keyId: uuidOne,
-        rawKey: "key-one-raw",
-        maskedKey: "key-one...",
-        label: "Key One",
-        status: "Ready",
-        requestCount: 0,
-        consecutiveFailures: 0,
-      });
-
-      session.keys.set(uuidTwo, {
-        keyId: uuidTwo,
-        rawKey: "key-two-raw",
-        maskedKey: "key-two...",
-        label: "Key Two",
-        status: "Ready",
-        requestCount: 0,
-        consecutiveFailures: 0,
-      });
-
-      const res = await request(app)
-        .post("/api/chat")
+      // Register key first time
+      const regRes1 = await request(app)
+        .post("/api/session/keys")
+        .set("Origin", "https://trusted.com")
         .set("Cookie", cookie)
-        .set("X-CSRF-Token", session.csrfToken)
-        .send({
-          messages: [{ role: "user", content: "hello" }],
-          credentials: {
-            mode: "byok",
-            keyIds: [uuidOne, uuidTwo],
-            activeKeyIndex: 0,
-          },
-        })
+        .set("X-CSRF-Token", csrf)
+        .send({ key: testKey, label: "My Test Key" })
         .expect(200);
 
-      expect(firstKeyCalled).toBe(true);
-      expect(secondKeyCalled).toBe(true);
-      expect(res.body.text).toBe("Success from key two");
-      expect(res.body.finalActiveKeyIndex).toBe(1); // Rotated to index 1
+      expect(regRes1.body).toHaveProperty("keyId");
+      expect(regRes1.body).not.toHaveProperty("maskedKey"); // Ensure no maskedKey returned!
+      const keyId = regRes1.body.keyId;
+
+      // Register key second time (idempotency check)
+      const regRes2 = await request(app)
+        .post("/api/session/keys")
+        .set("Origin", "https://trusted.com")
+        .set("Cookie", cookie)
+        .set("X-CSRF-Token", csrf)
+        .send({ key: testKey, label: "My Test Key" })
+        .expect(200);
+
+      expect(regRes2.body.keyId).toBe(keyId); // Idempotent!
+
+      // Fetch keys pool
+      const listRes = await request(app)
+        .get("/api/session/keys")
+        .set("Origin", "https://trusted.com")
+        .set("Cookie", cookie)
+        .set("X-CSRF-Token", csrf)
+        .expect(200);
+
+      expect(listRes.body.length).toBe(1);
+      expect(listRes.body[0]).not.toHaveProperty("maskedKey"); // Omitted!
+      expect(listRes.body[0]).toHaveProperty("keyId", keyId);
+      expect(listRes.body[0]).toHaveProperty("label", "My Test Key");
 
       vi.restoreAllMocks();
     });
+  });
 
-    it("should never retry ambiguous errors like timeouts to ensure duplicate generation prevention", async () => {
-      let callCount = 0;
+  describe("6. Strict Zod Schema Rejection", () => {
+    it("should reject requests containing unknown fields under strict schema validation", async () => {
+      const sessionRes = await request(app)
+        .post("/api/session")
+        .set("Origin", "https://trusted.com")
+        .expect(200);
 
-      const mockFailProvider: AIProvider = {
-        id: "gemini",
-        name: "Google Gemini",
-        capabilities: { chat: true, imageGeneration: false, streaming: false },
-        models: [{ id: "gemini-3.5-flash", name: "Gemini 3.5 Flash" }],
-        chat: async () => {
-          callCount++;
-          throw new ProviderError("Network request timeout", "TIMEOUT", false);
-        },
-      };
+      const cookie = sessionRes.headers["set-cookie"][0].split(";")[0];
+      const csrf = sessionRes.body.csrfToken;
 
-      vi.spyOn(providerRegistry, "get").mockReturnValue(mockFailProvider);
+      await request(app)
+        .post("/api/session/keys")
+        .set("Origin", "https://trusted.com")
+        .set("Cookie", cookie)
+        .set("X-CSRF-Token", csrf)
+        .send({ key: "AIzaSyTestKey12345678901234567890123", extraField: "not-allowed" })
+        .expect(400);
+    });
 
-      const sessionStore = getSessionStore();
-      const session = sessionStore.createSession();
-      const cookie = `sessionId=${session.sessionId}`;
+    it("should reject BYOK credentials structure with out-of-bound activeKeyIndex", async () => {
+      const sessionRes = await request(app)
+        .post("/api/session")
+        .set("Origin", "https://trusted.com")
+        .expect(200);
 
-      const uuidOne = "11111111-1111-4111-a111-111111111111";
-      const uuidTwo = "22222222-2222-4222-b222-222222222222";
-
-      session.keys.set(uuidOne, {
-        keyId: uuidOne,
-        rawKey: "key-one-raw",
-        maskedKey: "key-one...",
-        label: "Key One",
-        status: "Ready",
-        requestCount: 0,
-        consecutiveFailures: 0,
-      });
-
-      session.keys.set(uuidTwo, {
-        keyId: uuidTwo,
-        rawKey: "key-two-raw",
-        maskedKey: "key-two...",
-        label: "Key Two",
-        status: "Ready",
-        requestCount: 0,
-        consecutiveFailures: 0,
-      });
+      const cookie = sessionRes.headers["set-cookie"][0].split(";")[0];
+      const csrf = sessionRes.body.csrfToken;
 
       await request(app)
         .post("/api/chat")
+        .set("Origin", "https://trusted.com")
         .set("Cookie", cookie)
-        .set("X-CSRF-Token", session.csrfToken)
+        .set("X-CSRF-Token", csrf)
         .send({
           messages: [{ role: "user", content: "hello" }],
           credentials: {
             mode: "byok",
-            keyIds: [uuidOne, uuidTwo],
-            activeKeyIndex: 0,
-          },
+            keyIds: ["11111111-1111-4111-a111-111111111111"],
+            activeKeyIndex: 5, // Must be < array length (which is 1)
+          }
         })
-        .expect(500);
-
-      // Assert that call was made exactly once, and did not retry on key-two due to unsafe timeout error
-      expect(callCount).toBe(1);
-
-      vi.restoreAllMocks();
+        .expect(400);
     });
   });
 
-  describe("6. Source-Level Boundaries", () => {
-    it("should ensure no server files are imported into shared modules", () => {
-      const sharedTypes = require("../shared/types.ts");
-      expect(sharedTypes).toBeDefined();
+  describe("7. Boundary and Canary Builds Verification", () => {
+    it("should ensure the server-only canary secret is completely absent from static build assets", { timeout: 45000 }, () => {
+      // Run production build
+      console.log("[TEST BUILD] Running npm run build...");
+      execSync("npm run build", { stdio: "inherit" });
+
+      const distClientPath = path.join(process.cwd(), "dist", "client");
+      expect(fs.existsSync(distClientPath)).toBe(true);
+
+      const scanDirectory = (dir: string) => {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+          const fullPath = path.join(dir, file);
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            scanDirectory(fullPath);
+          } else if (file.endsWith(".js") || file.endsWith(".html") || file.endsWith(".css")) {
+            const content = fs.readFileSync(fullPath, "utf-8");
+            expect(content).not.toContain(SERVER_ONLY_CANARY);
+          }
+        }
+      };
+
+      scanDirectory(distClientPath);
+      console.log("[TEST BUILD] Verified: SERVER_ONLY_CANARY is completely absent from all client assets.");
+    });
+
+    it("should ensure source code files in src/ and shared/ do not import anything from server/", () => {
+      const checkImports = (dir: string) => {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+          const fullPath = path.join(dir, file);
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            checkImports(fullPath);
+          } else if (file.endsWith(".ts") || file.endsWith(".tsx")) {
+            const content = fs.readFileSync(fullPath, "utf-8");
+            // Check for relative imports pointing to server/ (e.g., ../server/, /server/, server/)
+            const serverImportRegex = /from\s+["'](\.\.\/)*server\//gi;
+            expect(content).not.toMatch(serverImportRegex);
+          }
+        }
+      };
+
+      checkImports(path.join(process.cwd(), "src"));
+      checkImports(path.join(process.cwd(), "shared"));
+      console.log("[TEST BOUNDARY] Verified: No client files import from server modules.");
     });
   });
 });

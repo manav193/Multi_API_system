@@ -8,7 +8,7 @@ export function assignRequestId(req: Request, res: Response, next: NextFunction)
   next();
 }
 
-// Extend Request interface to support custom id and logs
+// Extend Request interface to support custom id
 declare global {
   namespace Express {
     interface Request {
@@ -17,53 +17,50 @@ declare global {
   }
 }
 
-// Redact sensitive patterns like API keys, cookie headers, etc.
-export function redactSensitiveData(data: any): any {
-  if (!data) return data;
-  if (typeof data === "string") {
-    // Redact Gemini/Google API keys (e.g. AIzaSy...)
-    let redacted = data.replace(/AIzaSy[A-Za-z0-9_-]{31}/g, "[REDACTED_API_KEY]");
-    // Redact sessionId cookies or token values
-    redacted = redacted.replace(/sessionId=[a-f0-9-]+/gi, "sessionId=[REDACTED_SESSION_ID]");
-    redacted = redacted.replace(/x-csrf-token: [a-f0-9]+/gi, "x-csrf-token: [REDACTED_CSRF_TOKEN]");
-    redacted = redacted.replace(/authorization: .*/gi, "authorization: [REDACTED]");
-    return redacted;
-  }
-  if (Array.isArray(data)) {
-    return data.map((item) => redactSensitiveData(item));
-  }
-  if (typeof data === "object") {
-    const redactedObj: any = {};
-    for (const [key, value] of Object.entries(data)) {
-      // Redact specific sensitive fields by name
-      if (
-        key.toLowerCase().includes("key") ||
-        key.toLowerCase().includes("cookie") ||
-        key.toLowerCase().includes("authorization") ||
-        key.toLowerCase().includes("prompt") ||
-        key.toLowerCase().includes("message") ||
-        key.toLowerCase().includes("content") ||
-        key.toLowerCase().includes("token")
-      ) {
-        redactedObj[key] = "[REDACTED_SENSITIVE_FIELD]";
-      } else {
-        redactedObj[key] = redactSensitiveData(value);
-      }
-    }
-    return redactedObj;
-  }
-  return data;
+// Redact/sanitize sensitive patterns like API keys, cookie headers, etc. from any log string
+export function sanitizeMessage(msg: string): string {
+  if (!msg) return msg;
+  let result = msg;
+
+  // Redact Gemini/Google API keys (e.g. AIzaSy...)
+  result = result.replace(/AIzaSy[A-Za-z0-9_-]*/g, "[REDACTED_API_KEY]");
+  // Redact sessionId cookies or token values
+  result = result.replace(/sessionId=[A-Za-z0-9_-]+/gi, "sessionId=[REDACTED_SESSION_ID]");
+  result = result.replace(/x-csrf-token: [A-Za-z0-9_-]+/gi, "x-csrf-token: [REDACTED_CSRF_TOKEN]");
+  // Redact authorization headers
+  result = result.replace(/authorization: .*/gi, "authorization: [REDACTED]");
+  // Redact cookie headers
+  result = result.replace(/cookie: .*/gi, "cookie: [REDACTED]");
+  // Redact prompt fields
+  result = result.replace(/prompt: .*/gi, "prompt: [REDACTED]");
+  // Redact local path references and file/directory details
+  result = result.replace(/\/app\/applet[^\s:]*/gi, "[REDACTED_PATH]");
+  result = result.replace(/\/server\/[^\s:]*/gi, "[REDACTED_PATH]");
+
+  return result;
 }
 
-// Structured, redacted logging utility
+// Structured, redacted logging utility using ONLY allowlisted safe fields
 export function logStructuredError(requestId: string, message: string, meta: any = {}) {
-  const redactedMeta = redactSensitiveData(meta);
+  const cleanMessage = sanitizeMessage(message);
+
+  // Allowlist ONLY safe fields, dropping blacklist/arbitrary fields
+  const ALLOWED_LOG_FIELDS = ["url", "method", "statusCode", "type"];
+  const safeMeta: any = {};
+  if (meta && typeof meta === "object") {
+    for (const field of ALLOWED_LOG_FIELDS) {
+      if (meta[field] !== undefined) {
+        safeMeta[field] = typeof meta[field] === "string" ? sanitizeMessage(meta[field]) : meta[field];
+      }
+    }
+  }
+
   const logEntry = {
     timestamp: new Date().toISOString(),
-    requestId,
+    requestId: sanitizeMessage(requestId),
     level: "ERROR",
-    message: redactSensitiveData(message),
-    ...redactedMeta,
+    message: cleanMessage,
+    ...safeMeta,
   };
   console.error(JSON.stringify(logEntry));
 }
@@ -78,13 +75,11 @@ export function errorHandler(
   const requestId = req.id || "unknown";
   const statusCode = err.status || err.statusCode || 500;
 
-  // Redact all sensitive fields and log the error on the server side
+  // Log only allowlisted fields on the server side
   logStructuredError(requestId, err.message || "An unhandled error occurred", {
     url: req.url,
     method: req.method,
     statusCode,
-    // Avoid logging stack trace in production or testing if it contains sensitive contents
-    stack: process.env.NODE_ENV !== "production" ? redactSensitiveData(err.stack) : undefined,
   });
 
   // Return a sanitized, customer-facing response without details leaking
@@ -108,5 +103,22 @@ export function errorHandler(
   res.status(statusCode).json({
     error: message,
     requestId,
+  });
+}
+
+// Process-level unhandled rejection/exception handlers
+if (typeof process !== "undefined") {
+  process.on("unhandledRejection", (reason: any) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    logStructuredError("process", `Unhandled Rejection: ${msg}`, {
+      type: "unhandledRejection",
+    });
+  });
+
+  process.on("uncaughtException", (error: Error) => {
+    logStructuredError("process", `Uncaught Exception: ${error.message}`, {
+      type: "uncaughtException",
+    });
+    process.exit(1);
   });
 }

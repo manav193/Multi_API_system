@@ -25,15 +25,6 @@ router.post(
         return;
       }
 
-      // Check max keys limit per session (e.g., 5 keys maximum)
-      const MAX_KEYS = 5;
-      if (session.keys.size >= MAX_KEYS) {
-        res.status(400).json({
-          error: `Bad Request: Maximum of ${MAX_KEYS} custom keys allowed per session.`,
-        });
-        return;
-      }
-
       // Validate body parameters
       const parsed = RegisterKeySchema.safeParse(req.body);
       if (!parsed.success) {
@@ -46,11 +37,21 @@ router.post(
       const { key, label } = parsed.data;
       const trimmedKey = key.trim();
 
-      // Prevent duplicates in registration
-      const existingKeys = Array.from(session.keys.values());
-      if (existingKeys.some((ek) => ek.rawKey === trimmedKey)) {
+      // Make registration idempotent so lost responses do not create duplicates
+      const existingKeyEntry = Array.from(session.keys.values()).find((ek) => ek.rawKey === trimmedKey);
+      if (existingKeyEntry) {
+        res.json({
+          keyId: existingKeyEntry.keyId,
+          label: existingKeyEntry.label,
+        });
+        return;
+      }
+
+      // Check max keys limit per session (e.g., 5 keys maximum)
+      const MAX_KEYS = 5;
+      if (session.keys.size >= MAX_KEYS) {
         res.status(400).json({
-          error: "Bad Request: This key is already registered in your session pool.",
+          error: `Bad Request: Maximum of ${MAX_KEYS} custom keys allowed per session.`,
         });
         return;
       }
@@ -69,22 +70,20 @@ router.post(
           contents: "Ping",
         });
       } catch (err: any) {
-        // Return a generic, sanitized validation error
+        // Return a generic, sanitized validation error, NEVER returning err.message!
         res.status(400).json({
-          error: "Invalid API Key: The key failed connectivity checks. Details: " + (err.message || "Unauthorized"),
+          error: "Invalid API Key: The key failed connectivity checks.",
         });
         return;
       }
 
-      // Create secure, masked registration entry
+      // Create secure registration entry without maskedKey
       const keyId = crypto.randomUUID();
-      const maskedKey = `${trimmedKey.substring(0, 8)}...${trimmedKey.substring(trimmedKey.length - 4)}`;
       const keyLabel = label?.trim() || `User Key #${session.keys.size + 1}`;
 
       session.keys.set(keyId, {
         keyId,
         rawKey: trimmedKey,
-        maskedKey,
         label: keyLabel,
         status: "Ready",
         requestCount: 0,
@@ -93,7 +92,6 @@ router.post(
 
       res.json({
         keyId,
-        maskedKey,
         label: keyLabel,
       });
     } catch (err) {
@@ -102,7 +100,7 @@ router.post(
   }
 );
 
-// 2. GET /api/session/keys - List registered keys for the current session
+// 2. GET /api/session/keys - List registered keys for the current session (Only return keyId, label, status, and requestCount)
 router.get("/", (req: Request, res: Response, next: NextFunction): void => {
   try {
     const session = req.session;
@@ -113,7 +111,6 @@ router.get("/", (req: Request, res: Response, next: NextFunction): void => {
 
     const keysList = Array.from(session.keys.values()).map((k) => ({
       keyId: k.keyId,
-      maskedKey: k.maskedKey,
       label: k.label,
       status: k.status,
       requestCount: k.requestCount,

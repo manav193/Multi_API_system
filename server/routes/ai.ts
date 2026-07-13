@@ -35,6 +35,9 @@ async function executeWithRotation<T>(
   const logs: string[] = [];
   const keyStatuses: Record<string, string> = {};
 
+  const abortController = req.abortController || new AbortController();
+  const signal = abortController.signal;
+
   // Case 1: System-Default Key Mode
   if (credentials.mode === "system") {
     const defaultKey = process.env.GEMINI_API_KEY;
@@ -43,30 +46,9 @@ async function executeWithRotation<T>(
     }
 
     logs.push("[SYSTEM] Using Server Config Key (Default)...");
-    
-    // Set up AbortController for request cancellation and deadline timeout
-    const abortController = new AbortController();
-    const onReqAborted = () => {
-      logs.push("[CANCEL] Client disconnected. Aborting request.");
-      abortController.abort();
-    };
-    req.on("aborted", onReqAborted);
-
-    const onResClose = () => {
-      if (!res.writableEnded) {
-        logs.push("[CANCEL] Response closed prematurely. Aborting request.");
-        abortController.abort();
-      }
-    };
-    res.on("close", onResClose);
-
-    const timeoutId = setTimeout(() => {
-      logs.push("[TIMEOUT] Request exceeded 30s deadline. Aborting.");
-      abortController.abort();
-    }, 30000);
 
     try {
-      const result = await executeFn(defaultKey, abortController.signal);
+      const result = await executeFn(defaultKey, signal);
       return {
         result,
         finalActiveKeyIndex: 0,
@@ -75,12 +57,10 @@ async function executeWithRotation<T>(
       };
     } catch (err: any) {
       logs.push(`[ERROR] System default key failed: ${err.message}`);
+      if (req.timedOut) {
+        err.status = 504;
+      }
       throw err;
-    } finally {
-      // Clean up event listeners and timeouts
-      req.off("aborted", onReqAborted);
-      res.off("close", onResClose);
-      clearTimeout(timeoutId);
     }
   }
 
@@ -91,7 +71,6 @@ async function executeWithRotation<T>(
   // Validate that all keyIds belong to the current session (prevent Session A accessing Session B keys)
   for (const id of requestedKeyIds) {
     if (!session.keys.has(id)) {
-      // Return a generic, uninformative error to avoid fingerprinting key existence
       const err = new Error("Invalid or revoked credentials provided.");
       (err as any).status = 401;
       throw err;
@@ -122,6 +101,14 @@ async function executeWithRotation<T>(
   let attempt = 0;
 
   while (attempt < maxAttempts) {
+    if (signal.aborted) {
+      const err = new Error("Request aborted");
+      if (req.timedOut) {
+        (err as any).status = 504;
+      }
+      throw err;
+    }
+
     const targetIdx = (currentIndex + attempt) % eligibleKeys.length;
     const keyEntry = eligibleKeys[targetIdx];
 
@@ -141,30 +128,9 @@ async function executeWithRotation<T>(
 
     logs.push(`[ROTATE] Trying API Key ${keyEntry.label} (Attempt ${attempt + 1}/${maxAttempts})...`);
 
-    // Set up AbortController for the specific attempt
-    const abortController = new AbortController();
-    const onReqAborted = () => {
-      logs.push("[CANCEL] Client disconnected. Aborting attempt.");
-      abortController.abort();
-    };
-    req.on("aborted", onReqAborted);
-
-    const onResClose = () => {
-      if (!res.writableEnded) {
-        logs.push("[CANCEL] Response closed prematurely. Aborting attempt.");
-        abortController.abort();
-      }
-    };
-    res.on("close", onResClose);
-
-    const timeoutId = setTimeout(() => {
-      logs.push("[TIMEOUT] Attempt exceeded 30s deadline. Aborting.");
-      abortController.abort();
-    }, 30000);
-
     try {
       // Execute the request
-      const result = await executeFn(keyEntry.rawKey, abortController.signal);
+      const result = await executeFn(keyEntry.rawKey, signal);
 
       // Success cleanup and reporting
       keyEntry.status = "Active";
@@ -181,7 +147,6 @@ async function executeWithRotation<T>(
         keyStatuses,
       };
     } catch (err: any) {
-      // Handle failures
       keyEntry.consecutiveFailures += 1;
       
       let isRetrySafe = false;
@@ -219,6 +184,11 @@ async function executeWithRotation<T>(
         isRetrySafe = false; // Non-provider error is unsafe to retry
       }
 
+      if (req.timedOut) {
+        err.status = 504;
+        throw err;
+      }
+
       // If it is unsafe to retry (or we ran out of attempts), throw the error immediately
       if (!isRetrySafe || attempt + 1 >= maxAttempts) {
         logs.push("[ERROR] Key rotation stopped due to unsafe-to-retry error or exhaustion of attempts.");
@@ -226,11 +196,6 @@ async function executeWithRotation<T>(
       }
 
       attempt++;
-    } finally {
-      // Clean up event listeners and timeouts for this attempt
-      req.off("aborted", onReqAborted);
-      res.off("close", onResClose);
-      clearTimeout(timeoutId);
     }
   }
 
@@ -357,7 +322,7 @@ router.post("/validate-key", validationRateLimiter, async (req: Request, res: Re
     if (keyId === "system-default") {
       const defaultKey = process.env.GEMINI_API_KEY;
       if (!defaultKey) {
-        res.json({ valid: false, error: "System default key is not configured on the server." });
+        res.json({ valid: false, error: "System default key check failed." });
         return;
       }
 
@@ -369,7 +334,8 @@ router.post("/validate-key", validationRateLimiter, async (req: Request, res: Re
         });
         res.json({ valid: true });
       } catch (err: any) {
-        res.json({ valid: false, error: "System default key check failed: " + (err.message || "Unauthorized") });
+        // Return sanitized error message without err.message details
+        res.json({ valid: false, error: "System default key check failed." });
       }
       return;
     }
@@ -391,7 +357,8 @@ router.post("/validate-key", validationRateLimiter, async (req: Request, res: Re
       res.json({ valid: true });
     } catch (err: any) {
       keyEntry.status = "Invalid Key (403)";
-      res.json({ valid: false, error: "Validation failed: " + (err.message || "Unauthorized") });
+      // Return sanitized error message without err.message details
+      res.json({ valid: false, error: "Validation failed: The API key is invalid or inactive." });
     }
   } catch (err) {
     next(err);
