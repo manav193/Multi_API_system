@@ -239,6 +239,7 @@ export default function App() {
   const [newKeyInput, setNewKeyInput] = useState<string>("");
   const [newKeyLabel, setNewKeyLabel] = useState<string>("");
   const [validatingKeyId, setValidatingKeyId] = useState<string | null>(null);
+  const [csrfToken, setCsrfToken] = useState<string>("");
 
   // Workspace Files
   const [files, setFiles] = useState<VirtualFile[]>(() => {
@@ -299,46 +300,103 @@ export default function App() {
 
   // Fetch initial Server Key existence & set up Key Pool
   useEffect(() => {
-    const fetchSystemKeyStatus = async () => {
+    const initializeAndMigrate = async () => {
       try {
-        const response = await fetch("/api/system-key-status");
-        const data = await response.json();
-        
-        // Load custom keys from localStorage
-        const storedKeysStr = localStorage.getItem("aegis_custom_keys");
-        const storedKeys: APIKey[] = storedKeysStr ? JSON.parse(storedKeysStr) : [];
-        
-        let pool: APIKey[] = [];
-        
-        if (data.hasDefaultKey) {
+        // 1. Establish session and retrieve CSRF token
+        const sessionResponse = await fetch("/api/session", { method: "POST" });
+        if (!sessionResponse.ok) {
+          throw new Error("Failed to initialize session");
+        }
+        const { csrfToken: token } = await sessionResponse.json();
+        setCsrfToken(token);
+
+        // 2. Query system key status
+        const systemStatusResponse = await fetch("/api/system-key-status");
+        const systemStatus = await systemStatusResponse.json();
+
+        // 3. Migrate legacy keys from localStorage if they exist
+        const legacyKeysStr = localStorage.getItem("aegis_custom_keys");
+        const legacyKeys: any[] = legacyKeysStr ? JSON.parse(legacyKeysStr) : [];
+
+        const pool: APIKey[] = [];
+
+        // Add system key if available
+        if (systemStatus.hasDefaultKey) {
           pool.push({
             id: "system-default",
-            key: data.maskedDefaultKey || "Injected Server Key",
+            key: "Injected Server Key", // Never expose default key
             label: "Server Config Key (Default)",
             status: "Ready",
             requestCount: 0,
-            isSystemDefault: true
+            isSystemDefault: true,
           });
         }
-        
-        storedKeys.forEach((k) => {
-          // Prevent duplicating system key if any overlap
-          if (k.id !== "system-default") {
-            pool.push({
-              ...k,
-              status: "Ready" // Reset status on initial load to allow testing
-            });
+
+        // Migrate custom keys to server registry
+        if (legacyKeys.length > 0) {
+          addSystemLog(`Migrating ${legacyKeys.length} legacy API keys to secure session store...`);
+          for (const legacyKey of legacyKeys) {
+            if (legacyKey.key && legacyKey.key.startsWith("AIzaSy")) {
+              try {
+                const regResponse = await fetch("/api/session/keys", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    "X-CSRF-Token": token,
+                  },
+                  body: JSON.stringify({
+                    key: legacyKey.key,
+                    label: legacyKey.label,
+                  }),
+                });
+
+                if (regResponse.ok) {
+                  const regData = await regResponse.json();
+                  pool.push({
+                    id: regData.keyId,
+                    key: regData.maskedKey,
+                    label: regData.label,
+                    status: "Ready",
+                    requestCount: 0,
+                  });
+                } else {
+                  addSystemLog(`Failed to migrate legacy key: ${legacyKey.label}. It may be invalid.`, "error");
+                }
+              } catch (err) {
+                addSystemLog(`Migration error for key ${legacyKey.label}`, "error");
+              }
+            }
           }
-        });
-        
+
+          // Clear legacy raw keys from localStorage immediately
+          localStorage.removeItem("aegis_custom_keys");
+        }
+
+        // 4. Fetch currently registered keys from the session to sync with the pool
+        const keysResponse = await fetch("/api/session/keys");
+        if (keysResponse.ok) {
+          const registeredKeys: any[] = await keysResponse.json();
+          registeredKeys.forEach((rk) => {
+            if (!pool.some((pk) => pk.id === rk.keyId)) {
+              pool.push({
+                id: rk.keyId,
+                key: rk.maskedKey,
+                label: rk.label,
+                status: rk.status || "Ready",
+                requestCount: rk.requestCount || 0,
+              });
+            }
+          });
+        }
+
         setApiKeys(pool);
         addSystemLog("Loaded API key pool. Ready to handle requests.");
       } catch (err) {
-        addSystemLog("Error verifying system default key status.", "error");
+        addSystemLog("Error during session initialization.", "error");
       }
     };
     
-    fetchSystemKeyStatus();
+    initializeAndMigrate();
   }, []);
 
   // Sync virtual files, images, and chat history to localStorage
@@ -531,62 +589,98 @@ export default function App() {
     // Update statuses inside the Key Pool
     if (keyStatuses) {
       setApiKeys((prevKeys) => {
-        const updated = prevKeys.map((k) => {
-          // Check custom keys
+        return prevKeys.map((k) => {
           const matchedStatus = Object.keys(keyStatuses).find(
-            (srvKey) => srvKey === k.key || (k.isSystemDefault && srvKey.length > 20 && k.key.substring(0, 5) === srvKey.substring(0, 5))
+            (srvKeyId) => srvKeyId === k.id
           );
           if (matchedStatus) {
             return { ...k, status: keyStatuses[matchedStatus] as any };
           }
           return k;
         });
-        localStorage.setItem("aegis_custom_keys", JSON.stringify(updated.filter(k => !k.isSystemDefault)));
-        return updated;
       });
     }
   };
 
   // Add a key to the Pool
-  const handleAddKey = () => {
+  const handleAddKey = async () => {
     if (!newKeyInput.trim()) return;
 
-    const maskedStr = `${newKeyInput.substring(0, 8)}...${newKeyInput.substring(newKeyInput.length - 4)}`;
-    const newKey: APIKey = {
-      id: Math.random().toString(36).substring(7),
-      key: newKeyInput.trim(),
-      label: newKeyLabel.trim() || `Backup Key #${apiKeys.length + 1}`,
-      status: "Ready",
-      requestCount: 0
-    };
+    // Check if key is valid Gemini format
+    if (!newKeyInput.trim().startsWith("AIzaSy")) {
+      addSystemLog("Invalid key format. Gemini API keys must start with 'AIzaSy'.", "error");
+      return;
+    }
 
-    const updated = [...apiKeys, newKey];
-    setApiKeys(updated);
-    
-    // Save to localStorage (excluding system key)
-    const customOnly = updated.filter(k => !k.isSystemDefault);
-    localStorage.setItem("aegis_custom_keys", JSON.stringify(customOnly));
+    addSystemLog(`Registering new custom API key securely on server...`);
 
-    addSystemLog(`Added custom API Key: ${newKey.label}`);
-    setNewKeyInput("");
-    setNewKeyLabel("");
+    try {
+      const response = await fetch("/api/session/keys", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrfToken,
+        },
+        body: JSON.stringify({
+          key: newKeyInput.trim(),
+          label: newKeyLabel.trim() || `Custom Key #${apiKeys.length}`,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to register key.");
+      }
+
+      const newKey: APIKey = {
+        id: data.keyId,
+        key: data.maskedKey,
+        label: data.label,
+        status: "Ready",
+        requestCount: 0,
+      };
+
+      setApiKeys((prev) => [...prev, newKey]);
+      addSystemLog(`Successfully registered and activated custom key: ${newKey.label}`, "success");
+
+      setNewKeyInput("");
+      setNewKeyLabel("");
+    } catch (err: any) {
+      addSystemLog(`Key registration failed: ${err.message}`, "error");
+    }
   };
 
   // Delete a key from the Pool
-  const handleDeleteKey = (id: string) => {
+  const handleDeleteKey = async (id: string) => {
     const target = apiKeys.find((k) => k.id === id);
-    if (target?.isSystemDefault) {
+    if (!target) return;
+    if (target.isSystemDefault) {
       addSystemLog("Cannot delete System Default Key! (Injected via server config)", "error");
       return;
     }
 
-    const updated = apiKeys.filter((k) => k.id !== id);
-    setApiKeys(updated);
-    
-    const customOnly = updated.filter(k => !k.isSystemDefault);
-    localStorage.setItem("aegis_custom_keys", JSON.stringify(customOnly));
+    addSystemLog(`Revoking and deleting API key from server...`);
 
-    addSystemLog(`Removed API Key: ${target?.label || id}`);
+    try {
+      const response = await fetch(`/api/session/keys/${id}`, {
+        method: "DELETE",
+        headers: {
+          "X-CSRF-Token": csrfToken,
+        },
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.error || "Failed to delete key.");
+      }
+
+      setApiKeys((prev) => prev.filter((k) => k.id !== id));
+      addSystemLog(`Successfully revoked key: ${target.label}`, "success");
+      setActiveKeyIndex(0);
+    } catch (err: any) {
+      addSystemLog(`Failed to delete key: ${err.message}`, "error");
+    }
   };
 
   // Validate a single key instantly
@@ -596,13 +690,16 @@ export default function App() {
     try {
       const response = await fetch("/api/validate-key", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: keyVal })
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrfToken,
+        },
+        body: JSON.stringify({ keyId: id })
       });
       const data = await response.json();
 
       setApiKeys((prev) => {
-        const updated = prev.map((k) => {
+        return prev.map((k) => {
           if (k.id === id) {
             return {
               ...k,
@@ -611,8 +708,6 @@ export default function App() {
           }
           return k;
         });
-        localStorage.setItem("aegis_custom_keys", JSON.stringify(updated.filter(k => !k.isSystemDefault)));
-        return updated;
       });
 
       if (data.valid) {
@@ -648,8 +743,20 @@ export default function App() {
     setIsGenerating(true);
     addSystemLog(`Sending request to Coding Agent (${selectedModel})...`);
 
-    // Extract raw keys list (excluding labels and masks)
-    const customKeysRaw = apiKeys.filter((k) => !k.isSystemDefault).map((k) => k.key);
+    // Build credentials selection payload
+    const activeKey = apiKeys[activeKeyIndex];
+    let credentials;
+    if (!activeKey || activeKey.isSystemDefault) {
+      credentials = { mode: "system" as const };
+    } else {
+      const customKeys = apiKeys.filter((k) => !k.isSystemDefault);
+      const customActiveIndex = customKeys.findIndex((k) => k.id === activeKey.id);
+      credentials = {
+        mode: "byok" as const,
+        keyIds: customKeys.map((k) => k.id),
+        activeKeyIndex: customActiveIndex >= 0 ? customActiveIndex : 0,
+      };
+    }
 
     // Build standard message payload in Gemini history format
     const formattedHistory = messages.concat(userMsg).map((m) => ({
@@ -671,12 +778,14 @@ ${files.map((f) => `--- FILE: ${f.path} ---\n${f.content}\n`).join("\n")}
 
       const response = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrfToken,
+        },
         body: JSON.stringify({
           messages: formattedHistory,
           model: selectedModel,
-          userKeys: customKeysRaw,
-          activeKeyIndex,
+          credentials,
           systemInstruction: finalSystemInstruction,
           responseMimeType: "application/json",
           // Instruct the schema mapping matching our JSON structured layout
@@ -712,7 +821,17 @@ ${files.map((f) => `--- FILE: ${f.path} ---\n${f.content}\n`).join("\n")}
         processServerRotationLogs(data.logs, data.keyStatuses);
       }
       if (typeof data.finalActiveKeyIndex === "number") {
-        setActiveKeyIndex(data.finalActiveKeyIndex);
+        if (credentials.mode === "system") {
+          const sysIdx = apiKeys.findIndex((k) => k.isSystemDefault);
+          if (sysIdx >= 0) setActiveKeyIndex(sysIdx);
+        } else {
+          const customKeys = apiKeys.filter((k) => !k.isSystemDefault);
+          const selectedCustomKey = customKeys[data.finalActiveKeyIndex];
+          if (selectedCustomKey) {
+            const fullIdx = apiKeys.findIndex((k) => k.id === selectedCustomKey.id);
+            if (fullIdx >= 0) setActiveKeyIndex(fullIdx);
+          }
+        }
       }
 
       // Parse JSON from text
@@ -842,18 +961,33 @@ ${files.map((f) => `--- FILE: ${f.path} ---\n${f.content}\n`).join("\n")}
     setIsGeneratingImage(true);
     addSystemLog(`Invoking Image Lab (${imageModel}) for prompt: "${imagePrompt}"...`);
 
-    const customKeysRaw = apiKeys.filter((k) => !k.isSystemDefault).map((k) => k.key);
+    // Build credentials selection payload
+    const activeKey = apiKeys[activeKeyIndex];
+    let credentials;
+    if (!activeKey || activeKey.isSystemDefault) {
+      credentials = { mode: "system" as const };
+    } else {
+      const customKeys = apiKeys.filter((k) => !k.isSystemDefault);
+      const customActiveIndex = customKeys.findIndex((k) => k.id === activeKey.id);
+      credentials = {
+        mode: "byok" as const,
+        keyIds: customKeys.map((k) => k.id),
+        activeKeyIndex: customActiveIndex >= 0 ? customActiveIndex : 0,
+      };
+    }
 
     try {
       setDiagnosticsStats((prev) => ({ ...prev, totalRequests: prev.totalRequests + 1 }));
 
       const response = await fetch("/api/generate-image", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrfToken,
+        },
         body: JSON.stringify({
           prompt: imagePrompt,
-          userKeys: customKeysRaw,
-          activeKeyIndex,
+          credentials,
           imageSize,
           aspectRatio: imageAspect,
           model: imageModel
@@ -871,7 +1005,17 @@ ${files.map((f) => `--- FILE: ${f.path} ---\n${f.content}\n`).join("\n")}
         processServerRotationLogs(data.logs, data.keyStatuses);
       }
       if (typeof data.finalActiveKeyIndex === "number") {
-        setActiveKeyIndex(data.finalActiveKeyIndex);
+        if (credentials.mode === "system") {
+          const sysIdx = apiKeys.findIndex((k) => k.isSystemDefault);
+          if (sysIdx >= 0) setActiveKeyIndex(sysIdx);
+        } else {
+          const customKeys = apiKeys.filter((k) => !k.isSystemDefault);
+          const selectedCustomKey = customKeys[data.finalActiveKeyIndex];
+          if (selectedCustomKey) {
+            const fullIdx = apiKeys.findIndex((k) => k.id === selectedCustomKey.id);
+            if (fullIdx >= 0) setActiveKeyIndex(fullIdx);
+          }
+        }
       }
 
       const newImage: GeneratedImage = {
