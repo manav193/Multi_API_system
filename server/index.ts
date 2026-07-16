@@ -1,11 +1,18 @@
 import dotenv from "dotenv";
 import { createApp } from "./app.js";
+import { logStructuredError } from "./middleware/error.js";
+import { SERVER_ONLY_CANARY } from "./canary.js";
 
 // Load environment configuration
 dotenv.config();
 
 const PORT = 3000;
 const HOST = "0.0.0.0";
+
+// Reference the canary to ensure esbuild does not tree-shake it
+if (typeof globalThis !== "undefined" && (globalThis as any).__AegisCanaryCheck === "verify") {
+  console.log(SERVER_ONLY_CANARY);
+}
 
 async function run() {
   try {
@@ -42,13 +49,18 @@ async function run() {
   }
 }
 
-// Global Process exception monitoring
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+// Global Process exception monitoring routed through sanitized logging
+process.on("unhandledRejection", (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  logStructuredError("process", `Unhandled Rejection: ${msg}`, {
+    type: "unhandledRejection",
+  });
 });
 
 process.on("uncaughtException", (error) => {
-  console.error("Uncaught Exception captured:", error);
+  logStructuredError("process", `Uncaught Exception: ${error?.message || String(error)}`, {
+    type: "uncaughtException",
+  });
   process.exit(1);
 });
 

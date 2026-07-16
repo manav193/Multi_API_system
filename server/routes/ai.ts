@@ -4,6 +4,7 @@ import { ChatSchema, GenerateImageSchema, ValidateKeySchema, KeyRegistryEntry } 
 import { providerRegistry } from "../providers/registry.js";
 import { ProviderError } from "../providers/types.js";
 import { createRateLimiter } from "../middleware/rateLimiter.js";
+import { requireSession } from "../middleware/auth.js";
 
 const router = Router();
 
@@ -203,7 +204,7 @@ async function executeWithRotation<T>(
 }
 
 // 1. POST /api/chat - Structured chat endpoint with rotational failover
-router.post("/chat", aiRateLimiter, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+router.post("/chat", requireSession, aiRateLimiter, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const parsed = ChatSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -254,7 +255,7 @@ router.post("/chat", aiRateLimiter, async (req: Request, res: Response, next: Ne
 });
 
 // 2. POST /api/generate-image - Image generation with failover support
-router.post("/generate-image", aiRateLimiter, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+router.post("/generate-image", requireSession, aiRateLimiter, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const parsed = GenerateImageSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -300,7 +301,7 @@ router.post("/generate-image", aiRateLimiter, async (req: Request, res: Response
 });
 
 // 3. POST /api/validate-key - Validates a registered key via keyId
-router.post("/validate-key", validationRateLimiter, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+router.post("/validate-key", requireSession, validationRateLimiter, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const session = req.session;
     if (!session) {

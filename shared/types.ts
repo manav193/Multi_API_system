@@ -48,7 +48,7 @@ export const GenerateImageSchema = z.object({
   prompt: z.string().min(1, "Prompt is required").max(2000, "Prompt is too long"),
   model: z.enum(["imagen-3.0-generate-002", "gemini-3.1-flash-image", "imagen-3"]).optional(),
   credentials: CredentialSelectionSchema,
-  imageSize: z.enum(["1024x1024", "512x512", "large", "medium", "small"]).optional(),
+  imageSize: z.enum(["1K", "2K", "4K", "512px"]).optional(),
   aspectRatio: z.enum(["1:1", "3:4", "4:3", "9:16", "16:9"]).optional(),
 }).strict();
 

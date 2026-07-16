@@ -100,6 +100,10 @@ export function getRateLimitStore(): RateLimitStore {
   return globalStore;
 }
 
+// Global active concurrent requests counter (Concurrency Limit)
+let globalActiveConcurrentRequests = 0;
+const MAX_GLOBAL_CONCURRENT_REQUESTS = 100;
+
 // Create Rate Limiter middleware creator
 export function createRateLimiter(options: {
   keyPrefix: string;
@@ -107,33 +111,64 @@ export function createRateLimiter(options: {
   windowMs: number;
 }) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    let incrementedConcurrency = false;
     try {
+      // 1. Enforce Global Concurrency Limit
+      if (globalActiveConcurrentRequests >= MAX_GLOBAL_CONCURRENT_REQUESTS) {
+        res.status(429).json({
+          error: "Too many concurrent requests. Please try again later.",
+        });
+        return;
+      }
+      
+      globalActiveConcurrentRequests++;
+      incrementedConcurrency = true;
+
       const store = getRateLimitStore();
       
       // Rely ONLY on req.ip (express trust proxy configured in app.ts)
       const ip = req.ip || req.socket.remoteAddress || "unknown";
       const sessionId = req.session?.sessionId || "anonymous";
-      const route = req.originalUrl || req.path || "unknown-route";
+      
+      // Normalize route identifier by using req.path strictly (strips query string)
+      const route = req.path || "unknown-route";
 
-      // Combine ip, session/user, and route for the limiter key
-      const key = `${options.keyPrefix}:${ip}:${sessionId}:${route}`;
-
-      const { exceeded, limit, remaining, resetTime } = await store.isLimitExceeded(
-        key,
+      // 2. Enforce independent limits:
+      // A. Per-IP Route Limit
+      const keyIp = `ip:${options.keyPrefix}:${ip}:${route}`;
+      const ipResult = await store.isLimitExceeded(
+        keyIp,
         options.limit,
         options.windowMs
       );
 
-      const remainingResetSeconds = Math.max(0, Math.ceil((resetTime - Date.now()) / 1000));
+      // B. Per-Session Route Limit (only if session is authenticated)
+      let sessionResult = { exceeded: false, limit: options.limit, remaining: options.limit, resetTime: Date.now() + options.windowMs };
+      if (sessionId !== "anonymous") {
+        const keySession = `session:${options.keyPrefix}:${sessionId}:${route}`;
+        sessionResult = await store.isLimitExceeded(
+          keySession,
+          options.limit,
+          options.windowMs
+        );
+      }
+
+      // Determine the maximum/most restrictive response metrics
+      const exceeded = ipResult.exceeded || sessionResult.exceeded;
+      const limitVal = Math.min(ipResult.limit, sessionResult.limit);
+      const remainingVal = Math.min(ipResult.remaining, sessionResult.remaining);
+      const resetTimeVal = Math.max(ipResult.resetTime, sessionResult.resetTime);
+
+      const remainingResetSeconds = Math.max(0, Math.ceil((resetTimeVal - Date.now()) / 1000));
 
       // Set standard headers
-      res.setHeader("RateLimit-Limit", limit);
-      res.setHeader("RateLimit-Remaining", remaining);
+      res.setHeader("RateLimit-Limit", limitVal);
+      res.setHeader("RateLimit-Remaining", remainingVal);
       res.setHeader("RateLimit-Reset", remainingResetSeconds);
 
       // Set compatibility headers
-      res.setHeader("X-RateLimit-Limit", limit);
-      res.setHeader("X-RateLimit-Remaining", remaining);
+      res.setHeader("X-RateLimit-Limit", limitVal);
+      res.setHeader("X-RateLimit-Remaining", remainingVal);
       res.setHeader("X-RateLimit-Reset", remainingResetSeconds);
 
       if (exceeded) {
@@ -142,11 +177,30 @@ export function createRateLimiter(options: {
           error: "Too many requests. Please try again later.",
           retryAfter: remainingResetSeconds,
         });
+        
+        // Cleanup concurrency early since we exit
+        if (incrementedConcurrency) {
+          globalActiveConcurrentRequests = Math.max(0, globalActiveConcurrentRequests - 1);
+        }
         return;
       }
 
+      // Register cleanup on completion
+      const cleanup = () => {
+        if (incrementedConcurrency) {
+          globalActiveConcurrentRequests = Math.max(0, globalActiveConcurrentRequests - 1);
+          incrementedConcurrency = false;
+        }
+      };
+
+      res.on("finish", cleanup);
+      res.on("close", cleanup);
+
       next();
     } catch (err) {
+      if (incrementedConcurrency) {
+        globalActiveConcurrentRequests = Math.max(0, globalActiveConcurrentRequests - 1);
+      }
       next(err);
     }
   };

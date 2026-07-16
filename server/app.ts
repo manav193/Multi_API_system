@@ -4,25 +4,52 @@ import cookieParser from "cookie-parser";
 import sessionRouter from "./routes/session.js";
 import keysRouter from "./routes/keys.js";
 import aiRouter from "./routes/ai.js";
-import { loadSession, validateOriginAndCSRF, corsMiddleware } from "./middleware/auth.js";
+import { loadSession, validateOriginAndCSRF, corsMiddleware, requireSession } from "./middleware/auth.js";
 import { securityHeaders, payloadSizeLimit, requestTimeout } from "./middleware/security.js";
-import { assignRequestId, errorHandler } from "./middleware/error.js";
+import { assignRequestId, errorHandler, AppConfigError } from "./middleware/error.js";
 
 export async function createApp() {
   const app = express();
 
-  // Move production store validation to startup (never call process.exit inside constructors)
   const isProd = process.env.NODE_ENV === "production";
-  const allowOverride = process.env.ALLOW_IN_MEMORY_STORE === "true";
-  if (isProd && !allowOverride) {
-    console.error(
-      "CRITICAL ERROR: InMemory stores selected in production mode! Please set ALLOW_IN_MEMORY_STORE=true for single-instance testing or use Redis."
-    );
-    process.exit(1);
+
+  // Validate ALLOWED_ORIGINS and APP_URL on startup
+  const allowedOriginsRaw = process.env.ALLOWED_ORIGINS;
+  if (isProd && !allowedOriginsRaw && !process.env.APP_URL) {
+    throw new AppConfigError("ALLOWED_ORIGINS or APP_URL must be configured in production.");
   }
 
-  // Configure Express trust proxy explicitly for the deployment
-  const trustProxyVal = process.env.TRUST_PROXY || "127.0.0.1, ::1, loopback";
+  if (allowedOriginsRaw) {
+    const split = allowedOriginsRaw.split(/[,\s]+/);
+    for (const item of split) {
+      const trimmed = item.trim();
+      if (!trimmed) continue;
+      try {
+        new URL(trimmed);
+      } catch {
+        throw new AppConfigError(`Invalid URL origin in ALLOWED_ORIGINS: "${trimmed}"`);
+      }
+    }
+  }
+
+  if (process.env.APP_URL) {
+    try {
+      new URL(process.env.APP_URL.trim());
+    } catch {
+      throw new AppConfigError(`Invalid URL in APP_URL: "${process.env.APP_URL}"`);
+    }
+  }
+
+  // Move production store validation to startup (never call process.exit inside constructors)
+  const allowOverride = process.env.ALLOW_IN_MEMORY_STORE === "true";
+  if (isProd && !allowOverride) {
+    throw new AppConfigError(
+      "InMemory stores selected in production mode! Please set ALLOW_IN_MEMORY_STORE=true for single-instance testing or use Redis."
+    );
+  }
+
+  // Configure Express trust proxy explicitly for the deployment (Default to false!)
+  const trustProxyVal = process.env.TRUST_PROXY || "false";
   app.set("trust proxy", trustProxyVal === "true" ? true : trustProxyVal === "false" ? false : trustProxyVal);
 
   // 1. Core Request Configuration
@@ -46,7 +73,7 @@ export async function createApp() {
 
   // 6. Mount API Routes
   app.use("/api/session", sessionRouter);
-  app.use("/api/session/keys", keysRouter);
+  app.use("/api/session/keys", requireSession, keysRouter);
   app.use("/api", aiRouter); // Maps /api/chat, /api/generate-image, /api/validate-key, /api/system-key-status
 
   // 7. Static Asset / Vite development middleware loading

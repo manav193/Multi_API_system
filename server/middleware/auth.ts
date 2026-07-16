@@ -8,15 +8,20 @@ export interface Session {
   createdAt: number;
   expiresAt: number;
   keys: Map<string, KeyRegistryEntry>;
+  ip?: string;
 }
 
 // Parse ALLOWED_ORIGINS as an explicit normalized allowlist
 export function getAllowedOrigins(): string[] {
+  const isProd = process.env.NODE_ENV === "production";
   const origins = [
     process.env.APP_URL,
     process.env.ALLOWED_ORIGINS,
-    "http://localhost:3000",
-  ].filter(Boolean);
+  ].filter(Boolean) as string[];
+
+  if (!isProd) {
+    origins.push("http://localhost:3000");
+  }
 
   const parsed: string[] = [];
   for (const o of origins) {
@@ -26,6 +31,10 @@ export function getAllowedOrigins(): string[] {
       if (!trimmed) continue;
       try {
         const originUrl = new URL(trimmed);
+        const host = originUrl.hostname;
+        if (isProd && (host === "localhost" || host === "127.0.0.1" || host === "::1")) {
+          continue;
+        }
         parsed.push(originUrl.origin);
       } catch {
         parsed.push(trimmed);
@@ -57,7 +66,19 @@ export class InMemorySessionStore {
     }
   }
 
-  public createSession(): Session {
+  public createSession(ip: string): Session {
+    this.cleanup();
+
+    const activeSessions = Array.from(this.sessions.values());
+    const ipCount = activeSessions.filter((s) => s.ip === ip).length;
+    if (ipCount >= 10) {
+      throw new Error("Active session limit reached for this IP.");
+    }
+
+    if (this.sessions.size >= 1000) {
+      throw new Error("Global active session limit reached.");
+    }
+
     const sessionId = crypto.randomUUID();
     const csrfToken = crypto.randomBytes(32).toString("hex");
     const now = Date.now();
@@ -69,6 +90,7 @@ export class InMemorySessionStore {
       createdAt: now,
       expiresAt,
       keys: new Map(),
+      ip,
     };
 
     this.sessions.set(sessionId, session);
@@ -116,6 +138,8 @@ export function constantTimeCompare(a: string, b: string): boolean {
 
 // CORS Middleware with credentials and explicit allowed origin (no wildcard)
 export function corsMiddleware(req: Request, res: Response, next: NextFunction): void {
+  res.setHeader("Vary", "Origin");
+
   const origin = req.headers.origin;
   if (origin) {
     try {
@@ -124,9 +148,22 @@ export function corsMiddleware(req: Request, res: Response, next: NextFunction):
       if (allowed.includes(originStr)) {
         res.setHeader("Access-Control-Allow-Origin", origin);
         res.setHeader("Access-Control-Allow-Credentials", "true");
+      } else {
+        if (req.method === "OPTIONS") {
+          res.status(403).json({ error: "Forbidden: Origin verification failed (preflight)" });
+          return;
+        }
       }
     } catch {
-      // Ignore URL parse error
+      if (req.method === "OPTIONS") {
+        res.status(403).json({ error: "Forbidden: Invalid Origin header" });
+        return;
+      }
+    }
+  } else {
+    if (req.method === "OPTIONS") {
+      res.status(400).json({ error: "Bad Request: OPTIONS preflight missing Origin header" });
+      return;
     }
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
@@ -199,10 +236,10 @@ export function validateOriginAndCSRF(req: Request, res: Response, next: NextFun
   next();
 }
 
-// Session authentication and loading middleware with sliding TTL
+// Session loading middleware (Only loads, NEVER auto-creates unauthenticated session)
 export function loadSession(req: Request, res: Response, next: NextFunction): void {
   const sessionStore = getSessionStore();
-  let sessionId = req.cookies?.sessionId;
+  const sessionId = req.cookies?.sessionId;
   let session: Session | undefined;
 
   const sessionTtl = 2 * 60 * 60 * 1000; // 2 Hours sliding TTL
@@ -214,21 +251,29 @@ export function loadSession(req: Request, res: Response, next: NextFunction): vo
   if (session) {
     // Sliding TTL: refresh expiration
     session.expiresAt = Date.now() + sessionTtl;
-  } else {
-    session = sessionStore.createSession();
+
+    // Refresh HttpOnly secure session cookie
+    res.cookie("sessionId", session.sessionId, {
+      httpOnly: true,
+      sameSite: "lax",
+      path: "/",
+      maxAge: sessionTtl, // 2 Hours sliding TTL
+      secure: process.env.NODE_ENV === "production" || process.env.SECURE_COOKIES === "true",
+    });
+
+    // Bind session to request context
+    req.session = session;
   }
 
-  // Set or refresh HttpOnly secure session cookie
-  res.cookie("sessionId", session.sessionId, {
-    httpOnly: true,
-    sameSite: "lax",
-    path: "/",
-    maxAge: sessionTtl, // 2 Hours sliding TTL
-    secure: process.env.NODE_ENV === "production" || process.env.SECURE_COOKIES === "true",
-  });
+  next();
+}
 
-  // Bind session to request context
-  req.session = session;
+// Protection middleware requiring an active session
+export function requireSession(req: Request, res: Response, next: NextFunction): void {
+  if (!req.session) {
+    res.status(401).json({ error: "Unauthorized: Active session required" });
+    return;
+  }
   next();
 }
 

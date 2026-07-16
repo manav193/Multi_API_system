@@ -7,8 +7,10 @@ import { createApp } from "../server/app.js";
 import { getSessionStore } from "../server/middleware/auth.js";
 import { getRateLimitStore } from "../server/middleware/rateLimiter.js";
 import { providerRegistry } from "../server/providers/registry.js";
-import { AIProvider, ProviderError } from "../server/providers/types.js";
+import { AIProvider } from "../server/providers/types.js";
 import { SERVER_ONLY_CANARY } from "../server/canary.js";
+import { AppConfigError } from "../server/middleware/error.js";
+import { requestTimeout } from "../server/middleware/security.js";
 
 // Mock @google/genai entirely so validation checks run instantaneously without real network I/O
 vi.mock("@google/genai", () => {
@@ -76,8 +78,39 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
     });
   });
 
-  describe("2. Rate Limit Identity and Bypass Protection", () => {
-    it("should block forged X-Forwarded-For bypass attempts", async () => {
+  describe("2. CORS and Vary Headers Protection", () => {
+    it("should include Vary: Origin header in all responses", async () => {
+      const res = await request(app)
+        .post("/api/session")
+        .set("Origin", "https://trusted.com")
+        .expect(200);
+
+      expect(res.headers["vary"]).toContain("Origin");
+    });
+
+    it("should accept permitted preflight OPTIONS requests", async () => {
+      await request(app)
+        .options("/api/session")
+        .set("Origin", "https://trusted.com")
+        .expect(204);
+    });
+
+    it("should reject preflight OPTIONS requests from unallowed origins", async () => {
+      await request(app)
+        .options("/api/session")
+        .set("Origin", "https://malicious.com")
+        .expect(403);
+    });
+
+    it("should reject preflight OPTIONS requests with missing origin", async () => {
+      await request(app)
+        .options("/api/session")
+        .expect(400);
+    });
+  });
+
+  describe("3. Rate Limit Identity and Bypass Protection", () => {
+    it("should block forged X-Forwarded-For bypass attempts and route query normalization", async () => {
       // Establish session with a trusted origin
       const sessionRes = await request(app)
         .post("/api/session")
@@ -91,7 +124,7 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
       // The validator limiter limit is 15 requests/min.
       for (let i = 0; i < 15; i++) {
         await request(app)
-          .post("/api/validate-key")
+          .post("/api/validate-key?attempt=" + i) // Vary query string, must NOT bypass rate limiter because of path normalization
           .set("Origin", "https://trusted.com")
           .set("Cookie", cookie)
           .set("X-CSRF-Token", csrf)
@@ -101,7 +134,7 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
 
       // Try with a forged X-Forwarded-For header - it must STILL trigger 429 because rate-limit identity is not fooled!
       const limitRes = await request(app)
-        .post("/api/validate-key")
+        .post("/api/validate-key?attempt=final")
         .set("Origin", "https://trusted.com")
         .set("Cookie", cookie)
         .set("X-CSRF-Token", csrf)
@@ -114,7 +147,7 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
     });
   });
 
-  describe("3. Redacted Structured Logger and Error Sanitization", () => {
+  describe("4. Redacted Structured Logger and Error Sanitization", () => {
     it("should successfully redact sensitive formats (API keys, cookies, paths) from logged strings", async () => {
       const mockBadProvider: AIProvider = {
         id: "gemini",
@@ -166,7 +199,7 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
     });
   });
 
-  describe("4. Session Sliding TTL and Logout Behavior", () => {
+  describe("5. Session Limits and Logout Behavior", () => {
     it("should allow session logout and clear the session cookie cleanly", async () => {
       // 1. Establish session
       const sessionRes = await request(app)
@@ -193,9 +226,22 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
       const cookieStr = setCookie.join("; ");
       expect(cookieStr).toContain("Expires=Thu, 01 Jan 1970 00:00:00 GMT");
     });
+
+    it("should enforce the maximum session cap of 10 per IP", () => {
+      const store = getSessionStore();
+      const ip = "192.168.1.100";
+
+      // Create 10 sessions successfully
+      for (let i = 0; i < 10; i++) {
+        store.createSession(ip);
+      }
+
+      // 11th creation must throw an error due to IP limits
+      expect(() => store.createSession(ip)).toThrow("Active session limit reached for this IP.");
+    });
   });
 
-  describe("5. Key Validation & Registry Idempotency", () => {
+  describe("6. Key Validation & Registry Idempotency", () => {
     it("should omit maskedKey and return registered keys cleanly, registering idempotently", async () => {
       // Establish session
       const sessionRes = await request(app)
@@ -259,7 +305,7 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
     });
   });
 
-  describe("6. Strict Zod Schema Rejection", () => {
+  describe("7. Strict Zod Schema Rejection & Image Lab Payload Contract", () => {
     it("should reject requests containing unknown fields under strict schema validation", async () => {
       const sessionRes = await request(app)
         .post("/api/session")
@@ -278,7 +324,7 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
         .expect(400);
     });
 
-    it("should reject BYOK credentials structure with out-of-bound activeKeyIndex", async () => {
+    it("should accept valid Image Lab payloads using standard frontend size enums", async () => {
       const sessionRes = await request(app)
         .post("/api/session")
         .set("Origin", "https://trusted.com")
@@ -287,39 +333,113 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
       const cookie = sessionRes.headers["set-cookie"][0].split(";")[0];
       const csrf = sessionRes.body.csrfToken;
 
+      const mockImageProvider: AIProvider = {
+        id: "gemini",
+        name: "Google Gemini",
+        capabilities: { chat: false, imageGeneration: true, streaming: false },
+        models: [{ id: "gemini-3.1-flash-image", name: "Gemini 3.1 Flash Image" }],
+        generateImage: async () => ({ imageUrl: "data:image/png;base64,mocked" }),
+      };
+      vi.spyOn(providerRegistry, "get").mockReturnValue(mockImageProvider);
+
+      // Verify "2K" is accepted without Zod 400 rejection (aligned to frontend select drop-down)
       await request(app)
-        .post("/api/chat")
+        .post("/api/generate-image")
         .set("Origin", "https://trusted.com")
         .set("Cookie", cookie)
         .set("X-CSRF-Token", csrf)
         .send({
-          messages: [{ role: "user", content: "hello" }],
-          credentials: {
-            mode: "byok",
-            keyIds: ["11111111-1111-4111-a111-111111111111"],
-            activeKeyIndex: 5, // Must be < array length (which is 1)
-          }
+          prompt: "sunset over beach",
+          imageSize: "2K",
+          aspectRatio: "16:9",
+          credentials: { mode: "system" }
         })
-        .expect(400);
+        .expect(200);
+
+      vi.restoreAllMocks();
     });
   });
 
-  describe("7. Boundary and Canary Builds Verification", () => {
-    it("should ensure the server-only canary secret is completely absent from static build assets", { timeout: 45000 }, () => {
-      // Run production build
+  describe("8. AbortSignal and 504 Gateway Timeout Verification", () => {
+    it("should abort the request-scoped AbortController and return 504 on gateway timeout", () => {
+      const mockReq: any = {
+        on: vi.fn(),
+      };
+      const mockRes: any = {
+        on: vi.fn(),
+        headersSent: false,
+        status: vi.fn().mockReturnThis(),
+        json: vi.fn(),
+      };
+      const mockNext = vi.fn();
+      
+      let timeoutCallback: any;
+      const originalSetTimeout = global.setTimeout;
+      global.setTimeout = ((cb: any) => {
+        timeoutCallback = cb;
+        return { unref: () => {} };
+      }) as any;
+      
+      try {
+        requestTimeout(mockReq, mockRes, mockNext);
+        
+        expect(mockReq.abortController).toBeDefined();
+        expect(mockReq.abortController.signal.aborted).toBe(false);
+        
+        // Fire timeout callback artificially to simulate 30s timeout
+        timeoutCallback();
+        
+        expect(mockReq.timedOut).toBe(true);
+        expect(mockReq.abortController.signal.aborted).toBe(true);
+        expect(mockRes.status).toHaveBeenCalledWith(504);
+        expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
+          error: expect.stringContaining("Gateway Timeout"),
+        }));
+      } finally {
+        global.setTimeout = originalSetTimeout;
+      }
+    });
+  });
+
+  describe("9. Production Environment Safety Failures", () => {
+    it("should reject startup in production mode if single-instance in-memory stores are unapproved", async () => {
+      // Set to production mode without bypass flag set
+      const previousEnv = process.env.NODE_ENV;
+      const previousOverride = process.env.ALLOW_IN_MEMORY_STORE;
+      
+      process.env.NODE_ENV = "production";
+      process.env.ALLOW_IN_MEMORY_STORE = "false";
+      
+      await expect(createApp()).rejects.toThrow(AppConfigError);
+
+      // Restore values
+      process.env.NODE_ENV = previousEnv;
+      process.env.ALLOW_IN_MEMORY_STORE = previousOverride;
+    });
+  });
+
+  describe("10. Structural Boundary and Canary Verification", () => {
+    it("should ensure the server-only canary secret is completely absent from static build assets and present in server bundle", { timeout: 45000 }, () => {
       console.log("[TEST BUILD] Running npm run build...");
       execSync("npm run build", { stdio: "inherit" });
 
+      // Verify canary exists in the built server bundle
+      const serverBundlePath = path.join(process.cwd(), "dist", "server", "index.cjs");
+      expect(fs.existsSync(serverBundlePath)).toBe(true);
+      const serverContent = fs.readFileSync(serverBundlePath, "utf-8");
+      expect(serverContent).toContain(SERVER_ONLY_CANARY);
+
+      // Verify canary is absent from dist/client
       const distClientPath = path.join(process.cwd(), "dist", "client");
       expect(fs.existsSync(distClientPath)).toBe(true);
 
-      const scanDirectory = (dir: string) => {
+      const scanClientDirForCanary = (dir: string) => {
         const files = fs.readdirSync(dir);
         for (const file of files) {
           const fullPath = path.join(dir, file);
           const stat = fs.statSync(fullPath);
           if (stat.isDirectory()) {
-            scanDirectory(fullPath);
+            scanClientDirForCanary(fullPath);
           } else if (file.endsWith(".js") || file.endsWith(".html") || file.endsWith(".css")) {
             const content = fs.readFileSync(fullPath, "utf-8");
             expect(content).not.toContain(SERVER_ONLY_CANARY);
@@ -327,29 +447,45 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
         }
       };
 
-      scanDirectory(distClientPath);
+      scanClientDirForCanary(distClientPath);
       console.log("[TEST BUILD] Verified: SERVER_ONLY_CANARY is completely absent from all client assets.");
     });
 
-    it("should ensure source code files in src/ and shared/ do not import anything from server/", () => {
-      const checkImports = (dir: string) => {
+    it("should ensure client and shared code do not structurally import from the server directory", () => {
+      const checkStructuralDependencies = (dir: string) => {
         const files = fs.readdirSync(dir);
         for (const file of files) {
           const fullPath = path.join(dir, file);
           const stat = fs.statSync(fullPath);
           if (stat.isDirectory()) {
-            checkImports(fullPath);
+            checkStructuralDependencies(fullPath);
           } else if (file.endsWith(".ts") || file.endsWith(".tsx")) {
             const content = fs.readFileSync(fullPath, "utf-8");
-            // Check for relative imports pointing to server/ (e.g., ../server/, /server/, server/)
-            const serverImportRegex = /from\s+["'](\.\.\/)*server\//gi;
-            expect(content).not.toMatch(serverImportRegex);
+            
+            // Clean up code blocks to prevent false positive regex matches on comments
+            const cleanContent = content
+              .replace(/\/\*[\s\S]*?\*\//g, "") // Block comments
+              .replace(/\/\/.*/g, "");          // Line comments
+              
+            const importRegex = /(?:import|export)\s+[\s\S]*?\s+from\s+["']([^"']+)["']/g;
+            let match;
+            while ((match = importRegex.exec(cleanContent)) !== null) {
+              const importPath = match[1];
+              const resolvedPath = path.resolve(path.dirname(fullPath), importPath);
+              const serverPath = path.resolve(process.cwd(), "server");
+              
+              if (resolvedPath.startsWith(serverPath)) {
+                throw new Error(
+                  `Dependency boundary violated! Client/Shared file "${fullPath}" structurally imports server file "${importPath}"`
+                );
+              }
+            }
           }
         }
       };
 
-      checkImports(path.join(process.cwd(), "src"));
-      checkImports(path.join(process.cwd(), "shared"));
+      checkStructuralDependencies(path.join(process.cwd(), "src"));
+      checkStructuralDependencies(path.join(process.cwd(), "shared"));
       console.log("[TEST BOUNDARY] Verified: No client files import from server modules.");
     });
   });

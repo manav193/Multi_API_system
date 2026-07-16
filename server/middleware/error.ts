@@ -1,6 +1,14 @@
 import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
 
+// Typed configuration error class for testable startup validations
+export class AppConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AppConfigError";
+  }
+}
+
 // Request ID middleware to assign a unique ID to every incoming request
 export function assignRequestId(req: Request, res: Response, next: NextFunction): void {
   req.id = crypto.randomUUID();
@@ -72,6 +80,11 @@ export function errorHandler(
   res: Response,
   next: NextFunction
 ): void {
+  // Prevent double-response HTTP headers sent / writable ended races
+  if (res.headersSent || res.writableEnded) {
+    return;
+  }
+
   const requestId = req.id || "unknown";
   const statusCode = err.status || err.statusCode || 500;
 
@@ -103,22 +116,5 @@ export function errorHandler(
   res.status(statusCode).json({
     error: message,
     requestId,
-  });
-}
-
-// Process-level unhandled rejection/exception handlers
-if (typeof process !== "undefined") {
-  process.on("unhandledRejection", (reason: any) => {
-    const msg = reason instanceof Error ? reason.message : String(reason);
-    logStructuredError("process", `Unhandled Rejection: ${msg}`, {
-      type: "unhandledRejection",
-    });
-  });
-
-  process.on("uncaughtException", (error: Error) => {
-    logStructuredError("process", `Uncaught Exception: ${error.message}`, {
-      type: "uncaughtException",
-    });
-    process.exit(1);
   });
 }
