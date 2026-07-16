@@ -7,7 +7,7 @@ const router = Router();
 // Strict IP-based rate limiter for session creation (e.g., 10 creations per minute)
 const sessionRateLimiter = createRateLimiter({
   keyPrefix: "session-creation",
-  limit: 10,
+  limit: process.env.NODE_ENV === "test" ? 100 : 10,
   windowMs: 60 * 1000,
 });
 

@@ -489,4 +489,172 @@ describe("Aegis Resilient Full-Stack API Suite", () => {
       console.log("[TEST BOUNDARY] Verified: No client files import from server modules.");
     });
   });
+
+  describe("11. Production Mode Configuration & Cookie Behaviour", () => {
+    it("should use production cookie configurations (secure: true) in production mode", async () => {
+      const previousEnv = process.env.NODE_ENV;
+      const previousOverride = process.env.ALLOW_IN_MEMORY_STORE;
+      const previousAppUrl = process.env.APP_URL;
+
+      process.env.NODE_ENV = "production";
+      process.env.ALLOW_IN_MEMORY_STORE = "true"; // Approved for single-instance testing
+      process.env.APP_URL = "https://trusted.com";
+      
+      const prodApp = await createApp();
+      
+      const res = await request(prodApp)
+        .post("/api/session")
+        .set("Origin", "https://trusted.com")
+        .expect(200);
+      
+      const setCookie = res.headers["set-cookie"];
+      expect(setCookie).toBeDefined();
+      const cookieStr = setCookie.join("; ");
+      expect(cookieStr).toContain("Secure");
+      expect(cookieStr).toContain("HttpOnly");
+
+      process.env.NODE_ENV = previousEnv;
+      process.env.ALLOW_IN_MEMORY_STORE = previousOverride;
+      process.env.APP_URL = previousAppUrl;
+    });
+  });
+
+  describe("12. Session Refresh and Creation Safeguards", () => {
+    it("should not refresh session sliding expiration or issue cookies for requests rejected due to invalid origin", async () => {
+      // 1. Establish a valid session first
+      const sessionRes = await request(app)
+        .post("/api/session")
+        .set("Origin", "https://trusted.com")
+        .expect(200);
+
+      const cookie = sessionRes.headers["set-cookie"][0].split(";")[0];
+      
+      // 2. Perform a request with an INVALID origin, but including the valid session cookie
+      const rejectedRes = await request(app)
+        .post("/api/session/logout")
+        .set("Origin", "https://malicious.com") // Malicious origin!
+        .set("Cookie", cookie)
+        .expect(403);
+
+      expect(rejectedRes.body.error).toContain("Origin verification failed");
+
+      // CRITICAL ASSERTION: The response MUST NOT contain any Set-Cookie headers refreshing the session
+      expect(rejectedRes.headers["set-cookie"]).toBeUndefined();
+    });
+
+    it("should not create a session or set any cookies for public GET requests without credentials", async () => {
+      const res = await request(app)
+        .get("/api/system-key-status")
+        .expect(200);
+      
+      expect(res.headers["set-cookie"]).toBeUndefined();
+    });
+  });
+
+  describe("13. Provider AbortSignal and 504 Gateway Timeout Integration", () => {
+    it("should abort the provider call via AbortSignal on timeout and return exactly one 504 response", async () => {
+      // 1. Establish session
+      const sessionRes = await request(app)
+        .post("/api/session")
+        .set("Origin", "https://trusted.com")
+        .expect(200);
+
+      const cookie = sessionRes.headers["set-cookie"][0].split(";")[0];
+      const csrf = sessionRes.body.csrfToken;
+
+      let signalReceived: AbortSignal | undefined;
+      let abortedSuccessfully = false;
+
+      let onProviderCalled: (() => void) | undefined;
+      const providerCalledPromise = new Promise<void>((resolve) => {
+        onProviderCalled = resolve;
+      });
+
+      // Mock a slow provider that responds only after aborting
+      const slowProvider: AIProvider = {
+        id: "gemini",
+        name: "Google Gemini",
+        capabilities: { chat: true, imageGeneration: false, streaming: false },
+        models: [{ id: "gemini-3.5-flash", name: "Gemini 3.5 Flash" }],
+        chat: async (params, apiKey) => {
+          signalReceived = params?.signal;
+          if (onProviderCalled) {
+            onProviderCalled();
+          }
+          if (params?.signal) {
+            return new Promise((resolve, reject) => {
+              const onAbort = () => {
+                abortedSuccessfully = true;
+                reject(new Error("Request aborted by client/timeout."));
+              };
+              if (params.signal.aborted) {
+                onAbort();
+              } else {
+                params.signal.addEventListener("abort", onAbort);
+              }
+            });
+          }
+          return { text: "Immediate response" };
+        },
+      };
+
+      vi.spyOn(providerRegistry, "get").mockReturnValue(slowProvider);
+
+      // Temporarily mock setTimeout to artificially trigger the requestTimeout middleware's timeout quickly
+      const originalSetTimeout = global.setTimeout;
+      let timeoutCb: any;
+      global.setTimeout = ((cb: any, delay: number) => {
+        // Capture only the requestTimeout middleware's timeout (which is 30000ms) and return dummy timer
+        if (delay === 30000) {
+          timeoutCb = cb;
+          return { unref: () => {} };
+        }
+        return originalSetTimeout(cb, delay);
+      }) as any;
+
+      try {
+        // Fire request to slow endpoint
+        const promise = request(app)
+          .post("/api/chat")
+          .set("Origin", "https://trusted.com")
+          .set("Cookie", cookie)
+          .set("X-CSRF-Token", csrf)
+          .send({
+            messages: [{ role: "user", content: "slow request" }],
+            credentials: { mode: "system" }
+          });
+
+        // Wait precisely for the provider to be called, or fail early if HTTP request completes first
+        const raceResult = await Promise.race([
+          promise.then(res => ({ type: "response" as const, res })),
+          providerCalledPromise.then(() => ({ type: "called" as const }))
+        ]);
+
+        if (raceResult.type === "response") {
+          console.error("HTTP request completed prematurely:", raceResult.res.status, raceResult.res.body);
+          throw new Error(`HTTP request failed before reaching provider: ${raceResult.res.status} - ${JSON.stringify(raceResult.res.body)}`);
+        }
+
+        expect(signalReceived).toBeDefined();
+        expect(signalReceived?.aborted).toBe(false);
+
+        // Artificially trigger the captured timeout callback (simulating the 30s gateway timeout)
+        if (timeoutCb) {
+          timeoutCb();
+        }
+
+        const res = await promise;
+
+        expect(res.status).toBe(504);
+        expect(res.body.error).toContain("Gateway Timeout");
+
+        expect(signalReceived?.aborted).toBe(true);
+        expect(abortedSuccessfully).toBe(true);
+
+      } finally {
+        global.setTimeout = originalSetTimeout;
+        vi.restoreAllMocks();
+      }
+    });
+  });
 });

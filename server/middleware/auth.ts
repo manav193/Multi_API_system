@@ -176,17 +176,17 @@ export function corsMiddleware(req: Request, res: Response, next: NextFunction):
   next();
 }
 
-// Origin validation and CSRF middleware
-export function validateOriginAndCSRF(req: Request, res: Response, next: NextFunction): void {
+// Origin validation middleware (Only blocks state-changing requests with invalid origins)
+export function validateOrigin(req: Request, res: Response, next: NextFunction): void {
   const method = req.method;
 
-  // Safe methods do not require CSRF or state-changing Origin validation
+  // Safe methods do not require state-changing Origin validation
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
     next();
     return;
   }
 
-  // 1. Validate Origin header for all state-changing requests (including POST /api/session)
+  // Validate Origin header for all state-changing requests
   const origin = req.headers.origin;
   if (!origin) {
     res.status(403).json({ error: "Forbidden: Missing Origin header" });
@@ -207,21 +207,33 @@ export function validateOriginAndCSRF(req: Request, res: Response, next: NextFun
     return;
   }
 
+  next();
+}
+
+// CSRF validation middleware
+export function validateCSRF(req: Request, res: Response, next: NextFunction): void {
+  const method = req.method;
+
+  // Safe methods do not require CSRF validation
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+    next();
+    return;
+  }
+
   // Bypass CSRF for session initialization since session/cookie/token is not established yet
   if (req.path === "/session" || req.path === "/session/") {
     next();
     return;
   }
 
-  // 2. Validate CSRF token
+  // Validate CSRF token
   const sessionId = req.cookies?.sessionId;
   if (!sessionId) {
     res.status(401).json({ error: "Unauthorized: Missing session cookie" });
     return;
   }
 
-  const sessionStore = getSessionStore();
-  const session = sessionStore.getSession(sessionId);
+  const session = req.session;
   if (!session) {
     res.status(401).json({ error: "Unauthorized: Invalid or expired session" });
     return;

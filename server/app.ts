@@ -4,7 +4,7 @@ import cookieParser from "cookie-parser";
 import sessionRouter from "./routes/session.js";
 import keysRouter from "./routes/keys.js";
 import aiRouter from "./routes/ai.js";
-import { loadSession, validateOriginAndCSRF, corsMiddleware, requireSession } from "./middleware/auth.js";
+import { loadSession, validateOrigin, validateCSRF, corsMiddleware, requireSession } from "./middleware/auth.js";
 import { securityHeaders, payloadSizeLimit, requestTimeout } from "./middleware/security.js";
 import { assignRequestId, errorHandler, AppConfigError } from "./middleware/error.js";
 
@@ -65,11 +65,14 @@ export async function createApp() {
   app.use(payloadSizeLimit);
   app.use(requestTimeout);
 
-  // 4. Session initialization (applies to all /api/ requests)
+  // 4. Origin validation (applies to state-changing requests, must run BEFORE loadSession to prevent untrusted requests from refreshing sessions)
+  app.use("/api", validateOrigin);
+
+  // 5. Session initialization (applies to all /api/ requests)
   app.use("/api", loadSession);
 
-  // 5. Origin and CSRF protection (applies to state-changing endpoints)
-  app.use("/api", validateOriginAndCSRF);
+  // 6. CSRF validation (applies to state-changing endpoints, runs AFTER loadSession has populated the session context)
+  app.use("/api", validateCSRF);
 
   // 6. Mount API Routes
   app.use("/api/session", sessionRouter);
